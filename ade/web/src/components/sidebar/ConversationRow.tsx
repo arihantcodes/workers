@@ -1,11 +1,20 @@
 import uiClasses from '@iii-dev/console-ui/ui-classes'
-import { Bot, ChevronRight, MessageSquare, X } from 'lucide-react'
+import {
+  Bot,
+  Check,
+  ChevronRight,
+  MessageSquare,
+  Pencil,
+  X,
+} from 'lucide-react'
 import type { CSSProperties } from 'react'
 import { useEffect, useRef, useState } from 'react'
 import { SUBAGENT_ICON_COMPONENTS } from '@/components/chat/ActiveSubagentChips'
 import { StatusDot } from '@/components/ui/StatusDot'
 import { TriggerIcon } from '@/components/ui/TriggerIcon'
 import type { Conversation, SubagentColor } from '@/types/chat'
+
+const rowActionClassName = `${uiClasses.treeItemAction} pointer-coarse:min-h-12 pointer-coarse:min-w-12`
 
 interface ConversationRowProps {
   conversation: Conversation
@@ -69,6 +78,7 @@ function resolveGlyph(conversation: Conversation, depth: number): RowGlyph {
   return { Icon: MessageSquare }
 }
 
+/** Conversation tree row with touch rename actions and explicit-exit focus recovery. */
 export function ConversationRow({
   conversation,
   active,
@@ -83,11 +93,16 @@ export function ConversationRow({
   const [editing, setEditing] = useState(false)
   const [draft, setDraft] = useState(conversation.title)
   const inputRef = useRef<HTMLInputElement>(null)
+  const rowRef = useRef<HTMLDivElement>(null)
+  const restoreFocusRef = useRef(false)
 
   useEffect(() => {
     if (editing) {
       inputRef.current?.focus()
       inputRef.current?.select()
+    } else if (restoreFocusRef.current) {
+      restoreFocusRef.current = false
+      rowRef.current?.focus({ preventScroll: true })
     }
   }, [editing])
 
@@ -95,17 +110,26 @@ export function ConversationRow({
     if (!editing) setDraft(conversation.title)
   }, [conversation.title, editing])
 
+  /** Persist a nonempty changed title; blur callers retain their focus destination. */
   const commit = () => {
     setEditing(false)
     const next = draft.trim()
     if (next && next !== conversation.title) onRename(next)
   }
 
+  /** Discard explicit edits and restore focus after the editor unmounts. */
+  const cancel = () => {
+    restoreFocusRef.current = true
+    setEditing(false)
+    setDraft(conversation.title)
+  }
+
   const glyph = resolveGlyph(conversation, depth)
 
   return (
-    // biome-ignore lint/a11y/useSemanticElements: row hosts nested caret/delete <button>s; using a real <button> here would nest interactive elements.
+    // biome-ignore lint/a11y/useSemanticElements: row hosts nested editing/caret/delete <button>s; using a real <button> here would nest interactive elements.
     <div
+      ref={rowRef}
       role="button"
       tabIndex={editing ? -1 : 0}
       aria-current={active ? 'page' : undefined}
@@ -113,9 +137,11 @@ export function ConversationRow({
       className={uiClasses.treeItem}
       style={{ '--iii-ui-tree-depth': depth } as CSSProperties}
       onClick={() => !editing && onSelect()}
-      onDoubleClick={() => setEditing(true)}
+      onDoubleClick={(e) => {
+        if (!(e.target as HTMLElement).closest('button, form')) setEditing(true)
+      }}
       onKeyDown={(e) => {
-        if (editing) return
+        if (editing || e.target !== e.currentTarget) return
         if (e.key === 'Enter' || e.key === ' ') {
           e.preventDefault()
           onSelect()
@@ -133,26 +159,54 @@ export function ConversationRow({
         <glyph.Icon aria-hidden />
       </span>
       {editing ? (
-        <input
-          name="conversation-title"
-          aria-label="conversation title"
-          ref={inputRef}
-          value={draft}
-          onChange={(e) => setDraft(e.currentTarget.value)}
-          onBlur={commit}
+        <form
+          className="flex min-w-0 flex-1 items-center gap-2"
+          onClick={(e) => e.stopPropagation()}
+          onSubmit={(e) => {
+            e.preventDefault()
+            restoreFocusRef.current = true
+            commit()
+          }}
+          onBlur={(e) => {
+            if (!e.currentTarget.contains(e.relatedTarget)) commit()
+          }}
           onKeyDown={(e) => {
-            if (e.key === 'Enter') commit()
-            else if (e.key === 'Escape') {
-              setEditing(false)
-              setDraft(conversation.title)
+            if (e.key === 'Escape') {
+              e.preventDefault()
+              cancel()
             }
           }}
-          className="min-w-0 flex-1 rounded-xs bg-surface px-1 py-0.5 font-sans text-base font-medium text-ink outline-none sm:text-[13px]"
-        />
+        >
+          <input
+            name="conversation-title"
+            aria-label="conversation title"
+            ref={inputRef}
+            value={draft}
+            onChange={(e) => setDraft(e.currentTarget.value)}
+            className="min-w-0 flex-1 rounded-xs bg-surface px-1 py-0.5 font-sans text-base font-medium text-ink outline-none sm:text-[13px]"
+          />
+          <button
+            type="submit"
+            className={rowActionClassName}
+            aria-label="Save conversation title"
+            onPointerDown={(e) => e.preventDefault()}
+          >
+            <Check aria-hidden />
+          </button>
+          <button
+            type="button"
+            className={rowActionClassName}
+            aria-label="Cancel rename"
+            onPointerDown={(e) => e.preventDefault()}
+            onClick={cancel}
+          >
+            <X aria-hidden />
+          </button>
+        </form>
       ) : (
         <span className={uiClasses.treeItemLabel}>{conversation.title}</span>
       )}
-      {hasChildren ? (
+      {hasChildren && !editing ? (
         <button
           type="button"
           className={uiClasses.treeItemCaret}
@@ -168,31 +222,45 @@ export function ConversationRow({
           <ChevronRight aria-hidden />
         </button>
       ) : null}
-      <span className={uiClasses.treeItemTrailing}>
-        {conversation.status === 'working' ? (
-          <StatusDot tone="accent" pulse title="working" />
-        ) : conversation.status === 'error' ? (
-          <StatusDot
-            tone="alert"
-            title={conversation.statusReason ?? 'error'}
-          />
-        ) : null}
-        <span className={uiClasses.treeItemMeta}>
-          {formatRelative(conversation.updatedAt)}
+      {!editing ? (
+        <span className={uiClasses.treeItemTrailing}>
+          {conversation.status === 'working' ? (
+            <StatusDot tone="accent" pulse title="working" />
+          ) : conversation.status === 'error' ? (
+            <StatusDot
+              tone="alert"
+              title={conversation.statusReason ?? 'error'}
+            />
+          ) : null}
+          <span className={uiClasses.treeItemMeta}>
+            {formatRelative(conversation.updatedAt)}
+          </span>
+          <button
+            type="button"
+            className={rowActionClassName}
+            aria-label={`rename ${conversation.title}`}
+            title="Rename conversation"
+            onClick={(e) => {
+              e.stopPropagation()
+              setEditing(true)
+            }}
+          >
+            <Pencil aria-hidden />
+          </button>
+          <button
+            type="button"
+            className={rowActionClassName}
+            data-tone="alert"
+            aria-label={`delete ${conversation.title}`}
+            onClick={(e) => {
+              e.stopPropagation()
+              onRemove()
+            }}
+          >
+            <X aria-hidden />
+          </button>
         </span>
-        <button
-          type="button"
-          className={uiClasses.treeItemAction}
-          data-tone="alert"
-          aria-label={`delete ${conversation.title}`}
-          onClick={(e) => {
-            e.stopPropagation()
-            onRemove()
-          }}
-        >
-          <X aria-hidden />
-        </button>
-      </span>
+      ) : null}
     </div>
   )
 }
