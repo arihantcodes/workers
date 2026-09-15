@@ -56,6 +56,12 @@ interface FunctionTriggerCardProps {
   message: FunctionTriggerMessageType
   defaultOpen?: boolean
   /**
+   * Hydrate historical arguments/results when an unloaded card opens. May
+   * resolve to whether the read succeeded; `false` swaps the skeleton for a
+   * retry row instead of leaving the card loading forever.
+   */
+  onLoadDetails?: () => Promise<boolean> | undefined
+  /**
    * Approve handler. May be sync or async; the component shows a
    * `submitting…` state while the promise resolves and a red error row
    * if it rejects. Wire the actual `approval::resolve` call here.
@@ -540,6 +546,7 @@ function argsPreview(input: unknown): string | null {
 export function FunctionTriggerCard({
   message,
   defaultOpen,
+  onLoadDetails,
   onApprove,
   onDeny,
   onAlwaysAllow,
@@ -552,7 +559,7 @@ export function FunctionTriggerCard({
   // A placeholder from a paged transcript read: the header knows the function
   // and the description, the arguments and result are still on the server.
   // No renderer is consulted — there is nothing to render yet — and the body
-  // is a skeleton until the group fetches the whole entry.
+  // is a skeleton until the caller fetches the whole entry.
   const unloaded = !!message.unloaded && !pending && !running
   // Registry-dispatched custom panes: injected renderers first, then the
   // first-party families, then the JSON fallback below. First non-null
@@ -584,6 +591,37 @@ export function FunctionTriggerCard({
       : undefined
   const filesystemAccess = pending ? message.filesystemAccess : undefined
   const [open, setOpen] = useState(!!defaultOpen || pending)
+  const [loadFailed, setLoadFailed] = useState(false)
+  // Once per open, not per parent render (the parent hands over a fresh
+  // callback each render) and not per id: a hydration that lands the call
+  // but not its result re-derives the block id, and that is not a retry.
+  // Closing the card clears the latch, so reopening is a retry; so is the
+  // failure row's button. The same path hydrates default-open cards too.
+  // The latch is the request itself, so only the read this open is still
+  // waiting on may report its failure.
+  const requestedDetailsRef = useRef<symbol | null>(null)
+  const loadDetails = () => {
+    if (!onLoadDetails) return
+    const request = Symbol('load-details')
+    requestedDetailsRef.current = request
+    setLoadFailed(false)
+    Promise.resolve(onLoadDetails())
+      .catch(() => false)
+      .then((ok) => {
+        if (ok === false && requestedDetailsRef.current === request)
+          setLoadFailed(true)
+      })
+  }
+  // biome-ignore lint/correctness/useExhaustiveDependencies: `loadDetails` reads the current callback; the latch decides whether it runs.
+  useEffect(() => {
+    if (!open || !unloaded) {
+      requestedDetailsRef.current = null
+      setLoadFailed(false)
+      return
+    }
+    if (requestedDetailsRef.current) return
+    loadDetails()
+  }, [open, unloaded, onLoadDetails])
   // Closed calls read as a lightweight activity list. Opening one restores
   // the full raised function-call surface with the existing panes and
   // controls. Pending approvals remain surfaces because they require action.
@@ -851,6 +889,7 @@ export function FunctionTriggerCard({
         ) : null}
         <button
           type="button"
+          data-message-action="toggle-caret"
           aria-hidden="true"
           tabIndex={-1}
           onClick={() => setOpen((v) => !v)}
@@ -881,17 +920,35 @@ export function FunctionTriggerCard({
           {description ? (
             <FunctionIdentityRow functionId={message.functionId} />
           ) : null}
-          <div
-            role="status"
-            className="flex flex-col gap-2 px-3 py-3"
-            data-function-trigger-skeleton=""
-            aria-busy="true"
-            aria-label="loading call details"
-          >
-            <Skeleton className="h-3 w-2/3" />
-            <Skeleton className="h-3 w-1/2" />
-            <Skeleton className="h-3 w-5/6" />
-          </div>
+          {loadFailed ? (
+            <div
+              role="alert"
+              className="flex items-center gap-2 px-3 py-3 font-mono text-[12px] text-warn"
+              data-function-trigger-load-failed=""
+            >
+              <span>could not load call details</span>
+              <button
+                type="button"
+                data-message-action="retry-load"
+                onClick={loadDetails}
+                className="cursor-pointer underline underline-offset-2 hover:text-ink focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent"
+              >
+                retry
+              </button>
+            </div>
+          ) : (
+            <div
+              role="status"
+              className="flex flex-col gap-2 px-3 py-3"
+              data-function-trigger-skeleton=""
+              aria-busy="true"
+              aria-label="loading call details"
+            >
+              <Skeleton className="h-3 w-2/3" />
+              <Skeleton className="h-3 w-1/2" />
+              <Skeleton className="h-3 w-5/6" />
+            </div>
+          )}
         </div>
       ) : open ? (
         <div className="border-t border-rule-2">
