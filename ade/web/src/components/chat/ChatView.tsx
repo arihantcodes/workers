@@ -53,6 +53,7 @@ import {
 import type {
   ApprovalStreamEvent,
   CompactResult,
+  ContextUsageReport,
   QueuedMessagePreview,
 } from '@/lib/backend/types'
 import { requestComposerFocus } from '@/lib/composer-insert'
@@ -873,6 +874,44 @@ export function ChatView({
   const hasInjectedContextChip = extSessionChips.some(
     (chip) => chip.id === 'context',
   )
+
+  /* The context meter reads the harness's own accounting for the last
+   * generate step, once the transcript is ready and again each time a turn
+   * ends; the estimate inside ContextUsage only stands in before the first
+   * generate. Kept across a turn so the bar does not fall back to the
+   * estimate mid-stream. */
+  const [contextReport, setContextReport] = useState<{
+    id: string
+    report: ContextUsageReport
+  } | null>(null)
+  useEffect(() => {
+    const contextUsage = backend.contextUsage
+    if (
+      !contextUsage ||
+      conversation.draft ||
+      conversation.hydrated === false ||
+      streamingIndicator
+    )
+      return
+    let alive = true
+    void contextUsage(conversation.id)
+      .then((report) => {
+        if (alive && report !== null)
+          setContextReport({ id: conversation.id, report })
+      })
+      .catch(() => {})
+    return () => {
+      alive = false
+    }
+  }, [
+    backend.contextUsage,
+    conversation.id,
+    conversation.draft,
+    conversation.hydrated,
+    streamingIndicator,
+  ])
+  const reportedContext =
+    contextReport?.id === conversation.id ? contextReport.report : undefined
 
   /* Injected turn summaries live beside the composer rather than in the
    * transcript. Workers own their data and subscribe by session id; the host
@@ -2515,6 +2554,7 @@ export function ChatView({
                 <ContextUsage
                   messages={conversation.messages}
                   contextWindow={contextWindow}
+                  reported={reportedContext}
                 />
               )}
             </div>

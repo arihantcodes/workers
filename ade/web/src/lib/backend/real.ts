@@ -61,6 +61,7 @@ import type {
   ChatBackend,
   ChatStreamOptions,
   CompactResult,
+  ContextUsageReport,
   QueuedMessagePreview,
   StreamEvent,
 } from './types'
@@ -485,6 +486,26 @@ async function realListQueued(
   }))
 }
 
+/**
+ * `harness::status` → `context`: what the last request actually cost, the
+ * input budget it was fit into, and what was left, from the harness's own
+ * accounting. `null` before the first generate (or without a turn record).
+ */
+async function realContextUsage(
+  sessionId: string,
+): Promise<ContextUsageReport | null> {
+  const client = await getIiiClient()
+  const status = await getTurnStatus(client, sessionId).catch(() => null)
+  const context = status?.context
+  if (!context) return null
+  const { total, usable, free } = context
+  return typeof total === 'number' &&
+    typeof usable === 'number' &&
+    typeof free === 'number'
+    ? { total, usable, free }
+    : null
+}
+
 /** `harness::unqueue` — pull a still-parked message back out of the queue. */
 async function realRemoveQueued(
   sessionId: string,
@@ -771,6 +792,7 @@ export const realBackend: ChatBackend = {
   stream: realStream,
   queueMessage: realQueueMessage,
   listQueued: realListQueued,
+  contextUsage: realContextUsage,
   removeQueued: realRemoveQueued,
   editQueued: realEditQueued,
   onQueuedMessage: realOnQueuedMessage,
