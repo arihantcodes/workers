@@ -617,6 +617,34 @@ pub(crate) fn normalized_result(value: Value) -> ResultData {
     }
 }
 
+/// Bound a captured function result BEFORE it is written to the session or
+/// echoed to the provider: past `max_bytes` (0 disables) `content` + `details`
+/// are replaced by an elision marker, `is_error` kept. Applied once at the
+/// exit of `subscribe::invoke` and on the `function::resolve` deliver path.
+/// An oversized frame resets the engine connection and the SDK re-flushes it
+/// forever, wedging the worker (MOT-4498).
+pub(crate) fn cap_result(result: ResultData, max_bytes: usize) -> ResultData {
+    if max_bytes == 0 {
+        return result;
+    }
+    let max_bytes = max_bytes.max(1024); // the marker itself must fit
+    let total = serde_json::to_vec(&(&result.content, &result.details)).map_or(0, |b| b.len());
+    if total <= max_bytes {
+        return result;
+    }
+    let marker = format!(
+        "<omitted: result was ~{} KB, over the {} KB harness result cap; \
+         re-call with narrower arguments, or ask for a slice or summary instead>",
+        total / 1024,
+        max_bytes / 1024,
+    );
+    ResultData {
+        content: vec![ContentBlock::text(marker)],
+        is_error: result.is_error,
+        details: json!({ "result_capped": { "original_bytes": total, "max_bytes": max_bytes } }),
+    }
+}
+
 /// Compose operations that, without a target, act on EVERY container of the
 /// supervised project — the harness running this turn included. A
 /// project-wide `compose::restart {}` observed live (Linkly Ch. 7, MOT-4718)
@@ -913,6 +941,29 @@ mod tests {
     use super::*;
     use crate::types::turn::FunctionPolicy;
     use std::collections::BTreeMap;
+
+    #[test]
+    fn cap_result_bounds_oversized_results_and_only_those() {
+        let small = cap_result(normalized_result(json!({ "ok": true })), 262_144);
+        assert_eq!(small.details, json!({ "ok": true }));
+        let giant = json!({ "is_error": true, "blob": "x".repeat(300_000) });
+        assert_eq!(
+            cap_result(normalized_result(giant.clone()), 0).details,
+            giant
+        );
+        let capped = cap_result(normalized_result(giant), 1);
+        assert!(capped.is_error, "the tool's own error flag survives");
+        let text = match capped.content.as_slice() {
+            [ContentBlock::Text { text }] => text,
+            other => panic!("expected one text block, got {other:?}"),
+        };
+        assert!(text.starts_with("<omitted: result was ~"), "{text}");
+        let bytes = serde_json::to_vec(&(&capped.content, &capped.details))
+            .unwrap()
+            .len();
+        assert!(bytes <= 1024, "replacement must fit the floor, was {bytes}");
+        assert_eq!(capped.details["result_capped"]["max_bytes"], 1024);
+    }
 
     fn pol(allow: &[&str]) -> CompiledPolicy {
         CompiledPolicy::from(Some(&FunctionPolicy {

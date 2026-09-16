@@ -48,6 +48,12 @@ pub struct WorkerConfig {
     #[serde(default = "default_max_transient_resumes")]
     pub max_transient_resumes: u32,
 
+    /// Capture-time byte cap on a function result (`content` + `details`);
+    /// over it, an elision marker replaces the result. 0 disables, values
+    /// under 1 KiB are raised to 1 KiB (MOT-4498).
+    #[serde(default = "default_max_result_bytes")]
+    pub max_result_bytes: usize,
+
     /// TTL for `harness_idem` webhook-dedupe rows. Seconds.
     #[serde(default = "default_idem_ttl_secs")]
     pub idem_ttl_secs: u64,
@@ -228,6 +234,12 @@ fn default_max_transient_resumes() -> u32 {
     // (observed live 2026-07-21, session dcmcp-scan-p6w4-c-aq).
     3
 }
+/// Default for [`WorkerConfig::max_result_bytes`]: 256 KiB, the same ceiling
+/// `database` uses for its history (MOT-4372); the 16 MiB frame limit is the
+/// hard wall, the cap is also session hygiene.
+fn default_max_result_bytes() -> usize {
+    262_144
+}
 fn default_idem_ttl_secs() -> u64 {
     86_400
 }
@@ -301,6 +313,7 @@ impl Default for WorkerConfig {
             max_children: default_max_children(),
             max_validation_retries: default_max_validation_retries(),
             max_transient_resumes: default_max_transient_resumes(),
+            max_result_bytes: default_max_result_bytes(),
             idem_ttl_secs: default_idem_ttl_secs(),
             session_timeout_ms: default_session_timeout_ms(),
             context_timeout_ms: default_context_timeout_ms(),
@@ -327,6 +340,7 @@ mod tests {
         assert_eq!(cfg.max_depth, 3);
         assert_eq!(cfg.max_children, 8);
         assert_eq!(cfg.max_transient_resumes, 3);
+        assert_eq!(cfg.max_result_bytes, 262_144);
         assert_eq!(cfg.sweep_expression, "0 0 0 * * *");
         assert_eq!(cfg.projects_file_path, "data/harness-projects.json");
     }

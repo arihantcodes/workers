@@ -227,7 +227,8 @@ impl<'a> CallerModel<'a> {
 /// trusted caller context; the model cannot forge session-lock ownership.
 /// Everything else invokes the target normally. Every call site (the turn loop,
 /// `harness::function::trigger`, and the hook-held release path) routes through
-/// here so trusted context cannot be bypassed.
+/// here so trusted context cannot be bypassed — and so every result, error
+/// results included, leaves through one capture-time size cap (MOT-4498).
 #[allow(clippy::too_many_arguments)]
 pub async fn invoke(
     deps: &Deps,
@@ -239,37 +240,42 @@ pub async fn invoke(
     caller_holds_session_lock: bool,
     caller: Option<CallerModel<'_>>,
 ) -> ResultData {
-    if let Some(request) = send_invocation_context(
+    let send = send_invocation_context(
         function_id,
         arguments,
         session_id,
         caller_holds_session_lock,
-    ) {
-        return intercept_send(deps, request, session_id).await;
-    }
-    match function_id {
-        REGISTER_TRIGGER_ID => {
-            intercept_register(deps, arguments, session_id, caller, policy).await
+    );
+    let result = if let Some(request) = send {
+        intercept_send(deps, request, session_id).await
+    } else {
+        match function_id {
+            REGISTER_TRIGGER_ID => {
+                intercept_register(deps, arguments, session_id, caller, policy).await
+            }
+            UNREGISTER_TRIGGER_ID => intercept_unregister(deps, arguments, session_id).await,
+            crate::functions::triggers_list::TRIGGERS_LIST_ID
+            | crate::functions::triggers_list::TRIGGERS_UNREGISTER_ID => {
+                // In-turn controls always target their caller. External console
+                // calls bypass this chokepoint and continue supplying session_id.
+                let args = with_caller_session_id(arguments, session_id);
+                trigger::invoke_target(engine, policy, function_id, &args).await
+            }
+            internal if internal.starts_with("harness::state::") => {
+                trigger::denied_result(internal)
+            }
+            // Claiming a private state namespace is a control-plane act this
+            // worker performs for ITSELF. Agent calls are dispatched with the
+            // harness's own worker identity, so without this an agent could
+            // launder a claim through us and reserve arbitrary scopes — denying
+            // other workers the public `state::*` API. It could never READ them
+            // (the `harness::state::*` accessors are denied above), so the risk
+            // is denial of service, not exfiltration; deny it anyway.
+            crate::state::CLAIM_NAMESPACE_ID => trigger::denied_result(function_id),
+            _ => trigger::invoke_target(engine, policy, function_id, arguments).await,
         }
-        UNREGISTER_TRIGGER_ID => intercept_unregister(deps, arguments, session_id).await,
-        crate::functions::triggers_list::TRIGGERS_LIST_ID
-        | crate::functions::triggers_list::TRIGGERS_UNREGISTER_ID => {
-            // In-turn controls always target their caller. External console
-            // calls bypass this chokepoint and continue supplying session_id.
-            let args = with_caller_session_id(arguments, session_id);
-            trigger::invoke_target(engine, policy, function_id, &args).await
-        }
-        internal if internal.starts_with("harness::state::") => trigger::denied_result(internal),
-        // Claiming a private state namespace is a control-plane act this
-        // worker performs for ITSELF. Agent calls are dispatched with the
-        // harness's own worker identity, so without this an agent could
-        // launder a claim through us and reserve arbitrary scopes — denying
-        // other workers the public `state::*` API. It could never READ them
-        // (the `harness::state::*` accessors are denied above), so the risk
-        // is denial of service, not exfiltration; deny it anyway.
-        crate::state::CLAIM_NAMESPACE_ID => trigger::denied_result(function_id),
-        _ => trigger::invoke_target(engine, policy, function_id, arguments).await,
-    }
+    };
+    trigger::cap_result(result, deps.cfg().await.max_result_bytes)
 }
 
 fn send_invocation_context(
