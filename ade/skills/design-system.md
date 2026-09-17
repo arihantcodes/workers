@@ -218,7 +218,7 @@ ones in `index.d.ts`. State is expressed with `data-*` attributes (`data-selecte
 | --- | --- | --- |
 | `List` / `ListGroup` / `ListGroupLabel` | 4px gap; arrows and Home/End walk items | Do group with a 12px/600 label |
 | `ListItem` | 44px button row: `leading`, `label`, `description`, `trailing`, `selected` | Never accent on selection |
-| `uiClasses.tree*` | 28px rows, `--iii-ui-tree-depth`, `treeItemIcon[data-color]`, caret, `meta`, `action` | Phones: `data-narrow` |
+| `uiClasses.tree*` | 28px rows, `--iii-ui-tree-depth`, `treeItemIcon[data-color]`, caret, `meta`, `actions` wrapping every `action` | Do wrap the actions — a hidden one must never hold width. Phones: `data-narrow`; `data-pointer="fine"` drops a mouse-only action |
 
 ### Tables
 
@@ -368,3 +368,7 @@ The four hooks are `@iii-dev/console-ui/hooks`; the formatters are `@iii-dev/con
 - Don't use gradients, except `fcall-chrome` (function-call cards) and `thinking-shimmer`
   (streaming text), and no glow except `pulse-dot`.
 - Don't set a whole panel in mono, or technical values in sans.
+- Don't reach for a Tailwind utility to override a property a recipe already sets:
+  `ui-recipes.css` is imported unlayered, so a normal utility in `@layer utilities` loses to it
+  at any specificity and silently does nothing. Only an `!important` utility would win, and that
+  is not the answer — put the rule in the recipe, keyed by a data attribute.
