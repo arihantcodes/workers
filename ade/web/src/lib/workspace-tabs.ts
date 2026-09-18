@@ -12,7 +12,11 @@
  * the same tabs.
  */
 
-import type { View } from '@/hooks/use-hash-route'
+import {
+  routeFromHash,
+  standaloneRouteFromHash,
+  type View,
+} from '@/hooks/use-hash-route'
 import { moveItem } from '@/lib/reorder'
 
 /** `chat`, `chat:<session-id>`, a routed view, or `ext:<page-id>`. */
@@ -307,14 +311,16 @@ export const EXT_SCREEN_PREFIX = 'ext:'
 
 /**
  * First-party screens whose page migrated to injected UI, mapped to the
- * worker's page id (mirrors MIGRATED_ROUTES in `use-hash-route.ts`).
- * Persisted tabs saved before the migration rewrite through this map.
+ * worker's page id. Persisted tabs saved before the migration rewrite
+ * through this map.
  */
 const MIGRATED_SCREENS: Record<string, string> = {
   worktrees: 'worktree',
   memory: 'memory',
   browser: 'browser',
   github: 'github',
+  // The ide worker's page was `shell` until its UI/configuration rename.
+  'ext:shell': 'ide',
 }
 
 /** Configuration is deliberately NOT here: console settings open as an
@@ -338,22 +344,25 @@ export function screenForExtPage(pageId: string): TabScreen {
 }
 
 /**
- * The screen a routed view (+ ext page id) resolves to; `null` when the
- * view has no tab representation — configuration (an overlay page, not a
- * tab screen) and a not-yet-resolved ext route (the view and the page id
- * arrive from two hashchange listeners, so one commit can see `ext` with
- * a null id; reacting to that transient with a fallback screen used to
- * conjure duplicate tabs).
+ * The screen a routed view resolves to; `null` for configuration, an
+ * overlay page rather than a tab screen.
  */
-export function screenForView(
-  view: View,
-  extPageId: string | null,
-): TabScreen | null {
-  if (view === 'ext') {
-    return extPageId ? screenForExtPage(extPageId) : null
-  }
-  if (view === 'configuration') return null
-  return view
+export function screenForView(view: View): TabScreen | null {
+  return view === 'configuration' ? null : view
+}
+
+/**
+ * The screen a deep link names (`#/workers`), or `null` for the bare hash,
+ * settings, the standalone routes (`#/traces`, `#/worker/…` — those boot
+ * their own shell, main.tsx) and anything unknown. A deep link is a one-shot
+ * command — App opens the screen and drops the hash — never state: the tab
+ * store is the only memory of what is open.
+ */
+export function deepLinkScreen(hash: string): TabScreen | null {
+  if (hash === '' || hash === '#' || hash === '#/') return null
+  if (standaloneRouteFromHash(hash) !== null) return null
+  const view = routeFromHash(hash)
+  return view === null ? null : screenForView(view)
 }
 
 const isValidScreen = (s: unknown): s is TabScreen =>
