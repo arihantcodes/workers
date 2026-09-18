@@ -118,7 +118,13 @@ fn default_function_search_jev_min_relevance() -> f64 {
     0.5
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+fn default_function_search_jev_side_lane_min_relevance() -> f64 {
+    0.3
+}
+
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum FunctionSearchMode {
     Lexical,
@@ -219,11 +225,25 @@ fn deserialize_jev_min_relevance<'de, D>(deserializer: D) -> Result<f64, D::Erro
 where
     D: serde::Deserializer<'de>,
 {
+    deserialize_unit_interval(deserializer, "function_search_jev_min_relevance")
+}
+
+fn deserialize_jev_side_lane_min_relevance<'de, D>(deserializer: D) -> Result<f64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserialize_unit_interval(deserializer, "function_search_jev_side_lane_min_relevance")
+}
+
+fn deserialize_unit_interval<'de, D>(deserializer: D, field: &str) -> Result<f64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
     let value = f64::deserialize(deserializer)?;
     if !value.is_finite() || !(0.0..=1.0).contains(&value) {
-        return Err(serde::de::Error::custom(
-            "function_search_jev_min_relevance must be finite and between 0 and 1",
-        ));
+        return Err(serde::de::Error::custom(format!(
+            "{field} must be finite and between 0 and 1"
+        )));
     }
     Ok(value)
 }
@@ -385,6 +405,17 @@ pub struct SkillsConfig {
     #[schemars(range(min = 0, max = 1))]
     pub function_search_jev_min_relevance: f64,
 
+    /// Minimum Jev relevance for the side lanes (installed skills and
+    /// registered triggers), finite and between 0 and 1 inclusive. Those
+    /// documents score lower than functions for the same capability, so the
+    /// default sits below `function_search_jev_min_relevance`. Hot-reloadable.
+    #[serde(
+        default = "default_function_search_jev_side_lane_min_relevance",
+        deserialize_with = "deserialize_jev_side_lane_min_relevance"
+    )]
+    #[schemars(range(min = 0, max = 1))]
+    pub function_search_jev_side_lane_min_relevance: f64,
+
     /// Local semantic model directory: the pinned MiniLM bundle (embedding
     /// files at the root, reranker files under `reranker/`). Defaults to `~/.cache/iii/all-MiniLM-L6-v2-<revision>`;
     /// `null` disables the local Hybrid lane, including Jev's Hybrid fallback.
@@ -439,6 +470,8 @@ impl Default for SkillsConfig {
             function_search_jev_model: default_function_search_jev_model(),
             function_search_jev_timeout_ms: default_function_search_jev_timeout_ms(),
             function_search_jev_min_relevance: default_function_search_jev_min_relevance(),
+            function_search_jev_side_lane_min_relevance:
+                default_function_search_jev_side_lane_min_relevance(),
             function_search_model_path: default_function_search_model_path(),
             function_search_model_download: default_function_search_model_download(),
         }
@@ -662,6 +695,7 @@ mod tests {
             assert_eq!(value["function_search_jev_model"], "jev-1.13.0");
             assert_eq!(value["function_search_jev_timeout_ms"], 3000);
             assert_eq!(value["function_search_jev_min_relevance"], 0.5);
+            assert_eq!(value["function_search_jev_side_lane_min_relevance"], 0.3);
         }
     }
 
@@ -720,6 +754,10 @@ mod tests {
                 "function_search_jev_min_relevance",
                 serde_json::json!([-0.01, 1.01, null, "NaN", "Infinity", "0.5"]),
             ),
+            (
+                "function_search_jev_side_lane_min_relevance",
+                serde_json::json!([-0.01, 1.01, null, "NaN", "Infinity", "0.3"]),
+            ),
         ] {
             for invalid in invalid.as_array().unwrap() {
                 // Validate even when Jev is not the selected mode.
@@ -762,10 +800,15 @@ mod tests {
         assert_eq!(props["function_search_jev_timeout_ms"]["default"], 3000);
         assert_eq!(props["function_search_jev_timeout_ms"]["minimum"], 1.0);
         assert_eq!(props["function_search_jev_timeout_ms"]["maximum"], 30000.0);
-        assert_eq!(props["function_search_jev_min_relevance"]["type"], "number");
-        assert_eq!(props["function_search_jev_min_relevance"]["default"], 0.5);
-        assert_eq!(props["function_search_jev_min_relevance"]["minimum"], 0.0);
-        assert_eq!(props["function_search_jev_min_relevance"]["maximum"], 1.0);
+        for (field, default) in [
+            ("function_search_jev_min_relevance", 0.5),
+            ("function_search_jev_side_lane_min_relevance", 0.3),
+        ] {
+            assert_eq!(props[field]["type"], "number", "{field}");
+            assert_eq!(props[field]["default"], default, "{field}");
+            assert_eq!(props[field]["minimum"], 0.0, "{field}");
+            assert_eq!(props[field]["maximum"], 1.0, "{field}");
+        }
         assert_eq!(schema["example"], SkillsConfig::default().to_json());
         assert_eq!(props["function_search_jev_api_key"]["format"], "password");
         assert_eq!(
@@ -783,6 +826,7 @@ mod tests {
             "function_search_jev_model": "jev-custom",
             "function_search_jev_timeout_ms": 4500,
             "function_search_jev_min_relevance": 0.725,
+            "function_search_jev_side_lane_min_relevance": 0.2,
         }))
         .unwrap();
         assert_eq!(base.topology(), tuned.topology());
