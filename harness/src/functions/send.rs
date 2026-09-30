@@ -227,6 +227,21 @@ async fn start_with_delivery_lock(
     }
     let cfg = deps.cfg().await;
     let session = deps.session().await;
+    if req
+        .session
+        .as_ref()
+        .and_then(|init| init.metadata.as_ref())
+        .and_then(Value::as_object)
+        .is_some_and(is_read_only)
+    {
+        return Err(read_only_error(
+            req.session_id.as_deref().unwrap_or("new session"),
+        ));
+    }
+    let existing_metadata = match req.session_id.as_deref() {
+        Some(session_id) => writable_session_metadata(&session, session_id).await?,
+        None => None,
+    };
     let idempotent = match &req.idempotency_key {
         Some(key) => crate::state::get_idem(&deps.iii, key, cfg.session_timeout_ms).await?,
         None => None,
@@ -249,6 +264,13 @@ async fn start_with_delivery_lock(
             .is_some_and(|options| options.skills.is_some()),
     )? {
         return Ok(outcome);
+    }
+    if prev.is_none()
+        && existing_metadata
+            .as_ref()
+            .is_some_and(|metadata| metadata.contains_key("external_source"))
+    {
+        validate_existing_session_start(&req)?;
     }
     // Resolve the agent profile (if named) BEFORE the model gate and session
     // creation: the profile's model is a fallback for a session-creating send,
@@ -483,6 +505,8 @@ pub async fn inject(
     entry_id: Option<&str>,
     origin: Option<&Value>,
 ) -> Result<StartOutcome, HarnessError> {
+    let session = deps.session().await;
+    writable_session_metadata(&session, session_id).await?;
     let cfg = deps.cfg().await;
 
     let options = crate::state::get_turn(&deps.iii, session_id, cfg.session_timeout_ms)
@@ -511,6 +535,67 @@ pub async fn inject(
     )
     .await
     .map(|(outcome, _)| outcome)
+}
+
+fn is_read_only(metadata: &serde_json::Map<String, Value>) -> bool {
+    metadata.get("read_only").and_then(Value::as_bool) == Some(true)
+}
+
+/// Rejects a session whose metadata carries `read_only: true`, for callers that already hold it.
+pub(crate) fn ensure_writable(
+    metadata: &serde_json::Map<String, Value>,
+    session_id: &str,
+) -> Result<(), HarnessError> {
+    if is_read_only(metadata) {
+        return Err(read_only_error(session_id));
+    }
+    Ok(())
+}
+
+fn read_only_error(session_id: &str) -> HarnessError {
+    HarnessError::InvalidRequest(format!(
+        "session `{session_id}` is read-only and cannot accept messages"
+    ))
+}
+
+async fn writable_session_metadata(
+    session: &crate::clients::SessionClient,
+    session_id: &str,
+) -> Result<Option<serde_json::Map<String, Value>>, HarnessError> {
+    let metadata = session.metadata_of(session_id).await?;
+    if metadata.as_ref().is_some_and(is_read_only) {
+        return Err(read_only_error(session_id));
+    }
+    Ok(metadata)
+}
+
+fn validate_existing_session_start(req: &SendRequest) -> Result<(), HarnessError> {
+    if !req
+        .model
+        .as_deref()
+        .is_some_and(|model| !model.trim().is_empty())
+    {
+        return Err(HarnessError::InvalidRequest(
+            "harness::send starting an existing session with no prior turn requires an explicit `model`"
+                .into(),
+        ));
+    }
+    let root = req
+        .options
+        .as_ref()
+        .and_then(|options| options.metadata.as_ref())
+        .and_then(Value::as_object)
+        .and_then(|metadata| metadata.get(crate::types::turn::FS_SCOPE_KEY))
+        .and_then(Value::as_object)
+        .and_then(|scope| scope.get(crate::types::turn::FS_SCOPE_ROOT_KEY))
+        .and_then(Value::as_str);
+    if !root.is_some_and(|root| !root.trim().is_empty()) {
+        return Err(HarnessError::InvalidRequest(
+            "harness::send starting an existing session with no prior turn requires an explicit `options.metadata.fs_scope.root`"
+                .into(),
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
@@ -1434,6 +1519,16 @@ mod tests {
     use iii_helpers::observability::opentelemetry::Context;
     use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider, SimpleSpanProcessor};
     use std::sync::Arc;
+
+    #[test]
+    fn a_reused_session_must_be_writable() {
+        let metadata = |value: Value| value.as_object().unwrap().clone();
+        assert!(ensure_writable(&metadata(serde_json::json!({})), "s").is_ok());
+        assert!(ensure_writable(&metadata(serde_json::json!({"read_only": false})), "s").is_ok());
+        let error =
+            ensure_writable(&metadata(serde_json::json!({"read_only": true})), "s").unwrap_err();
+        assert!(error.to_string().contains("read-only"), "{error}");
+    }
 
     fn failed_send_session_attribute(result: Result<(), HarnessError>) -> Option<String> {
         let exporter = InMemorySpanExporter::default();

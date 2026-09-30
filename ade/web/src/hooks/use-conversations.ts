@@ -643,6 +643,8 @@ export function applyConversationMetadataPatch(
   patch: ConversationMetadataEdits,
   now = Date.now(),
 ): Conversation {
+  if (c.sessionMetadata?.read_only === true && !Object.hasOwn(patch, 'title'))
+    return c
   const normalized: ConversationMetadataEdits = Object.hasOwn(patch, 'skills')
     ? { ...patch, skills: patch.skills?.length ? patch.skills : undefined }
     : patch
@@ -2661,6 +2663,8 @@ export function useConversations(
         queue.delete(id)
         const conv = conversationsRef.current.find((c) => c.id === id)
         if (!serverEnabled || !conv || conv.draft) return
+        // A read-only session keeps its metadata; only a rename is written.
+        if (conv.sessionMetadata?.read_only === true && !queuedTitle) return
         void setSessionMeta({
           session_id: id,
           ...(queuedTitle ? { title: queuedTitle } : {}),
@@ -2841,6 +2845,11 @@ export function useConversations(
 
   const setWorkingDir = useCallback(
     (id: string, dir: string | null) => {
+      if (
+        conversationsRef.current.find((c) => c.id === id)?.sessionMetadata
+          ?.read_only === true
+      )
+        return
       editMeta(id, (c) =>
         applyConversationMetadataPatch(c, { workingDir: dir }),
       )
@@ -2867,7 +2876,11 @@ export function useConversations(
 
   const appendMessage = useCallback(
     (id: string, message: Message) =>
-      patchConversation(id, (c) => appendMessageToConversation(c, message)),
+      patchConversation(id, (c) =>
+        c.sessionMetadata?.read_only === true
+          ? c
+          : appendMessageToConversation(c, message),
+      ),
     [patchConversation],
   )
 
@@ -2885,11 +2898,15 @@ export function useConversations(
 
   const compactConversation = useCallback(
     (id: string, marker: Message) =>
-      patchConversation(id, (c) => ({
-        ...c,
-        messages: [marker],
-        updatedAt: Date.now(),
-      })),
+      patchConversation(id, (c) =>
+        c.sessionMetadata?.read_only === true
+          ? c
+          : {
+              ...c,
+              messages: [marker],
+              updatedAt: Date.now(),
+            },
+      ),
     [patchConversation],
   )
 

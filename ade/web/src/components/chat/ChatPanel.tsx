@@ -1,4 +1,4 @@
-import { Plus } from 'lucide-react'
+import { Download, Plus } from 'lucide-react'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { ConversationSidebar } from '@/components/sidebar/ConversationSidebar'
 import { Button } from '@/components/ui/Button'
@@ -22,6 +22,7 @@ import {
 import type { PageCommandsApi, PanelSide } from '@/types/injectable-ui'
 import { ChatView } from './ChatView'
 import { ConversationLoadNotice } from './ConversationLoadNotice'
+import { ImportConversationsDialog } from './ImportConversationsDialog'
 
 // viewport: phone chrome — the sm and md utilities here are the console's
 // phone-vs-desktop presentation (touch sizes, 16px text, sheet vs popover),
@@ -92,6 +93,7 @@ export function ChatPanel({
     retryConversations,
     missingConversationIds,
   } = useConversationsCtx()
+  const [importOpen, setImportOpen] = useState(false)
   const pinned = conversationId !== undefined
   const displayedConversation = pinned
     ? (conversations.find(
@@ -287,6 +289,11 @@ export function ChatPanel({
       }}
       className="chat-surface flex-1 flex flex-col min-h-0 min-w-0"
     >
+      <ImportConversationsDialog
+        open={importOpen}
+        onOpenChange={setImportOpen}
+        onImported={handleSelect}
+      />
       <ConversationLoadNotice
         loading={conversationsLoading && connectionState === 'connected'}
         error={
@@ -312,16 +319,25 @@ export function ChatPanel({
             resizable
             narrow={narrow}
             header={
-              <Button
-                type="button"
-                variant="primary"
-                size="md"
-                className="h-12 flex-1 justify-center px-3 font-sans text-base normal-case sm:h-9 sm:justify-start sm:text-sm"
-                onClick={handleCreate}
-              >
-                <Plus className="size-4 shrink-0" aria-hidden />
-                New chat
-              </Button>
+              <>
+                <Button
+                  type="button"
+                  variant="primary"
+                  size="md"
+                  className="h-12 flex-1 justify-center px-3 font-sans text-base normal-case sm:h-9 sm:justify-start sm:text-sm"
+                  onClick={handleCreate}
+                >
+                  <Plus className="size-4 shrink-0" aria-hidden />
+                  New chat
+                </Button>
+                <IconButton
+                  label="Import conversations"
+                  className="max-sm:size-12"
+                  onClick={() => setImportOpen(true)}
+                >
+                  <Download aria-hidden />
+                </IconButton>
+              </>
             }
             collapsedActions={
               <IconButton
