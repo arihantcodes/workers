@@ -6,6 +6,7 @@
 import type { Host } from '@iii-dev/console-ui'
 import { coderDelete, joinPath } from './coder'
 import type { GitChange, GitFileStatus } from './git'
+import { basename } from './paths'
 
 interface ExecResponse {
   exit_code: number | null
@@ -16,10 +17,24 @@ interface ExecResponse {
   stderr_truncated: boolean
 }
 
-async function git(host: Host, cwd: string, args: string[], timeoutMs = 30_000): Promise<ExecResponse> {
+/** `git` in `cwd`. `stdin` is fed to it; `env` adds to its environment. */
+export async function git(
+  host: Host,
+  cwd: string,
+  args: string[],
+  timeoutMs = 30_000,
+  options: { stdin?: string; env?: Record<string, string> } = {},
+): Promise<ExecResponse> {
   return host.iii.trigger<ExecResponse>(
     'shell::exec',
-    { command: 'git', args, cwd, timeout_ms: timeoutMs },
+    {
+      command: 'git',
+      args,
+      cwd,
+      timeout_ms: timeoutMs,
+      ...(options.stdin === undefined ? {} : { stdin: options.stdin }),
+      ...(options.env === undefined ? {} : { env: options.env }),
+    },
     // The bus must outwait the command: a push can take the whole cap.
     { timeoutMs: timeoutMs + 10_000 },
   )
@@ -52,7 +67,7 @@ const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
     anything and gives up untouched when the lock is held, so a lock failure
     is retried; `safeToRetry` lets a caller veto that when a command may have
     got further (a stash that already stored its entry). */
-async function run(
+export async function run(
   host: Host,
   root: string,
   args: string[],
@@ -117,53 +132,84 @@ export function discardStep(change: Pick<GitChange, 'path' | 'status' | 'staged'
   return { kind: 'restore', path: change.path }
 }
 
-/** Discard working-tree (and index) changes for the given files. Each
-    change is undone on its own so one failure names one file.
-    `keepAdded` only un-adds an added file, leaving it on disk as unversioned
-    (the Rollback dialog's unticked "Delete local copies of added files"). */
+/** Discard working-tree (and index) changes for the given files in a few
+    calls for the lot, in each change's own order: every restore, then
+    every unstage, then every delete. A call that fails is retried file by
+    file, so a failure names its file, and a failed change skips the rest
+    of its steps. `keepAdded` only un-adds an added file, leaving it on disk
+    as unversioned (the Rollback dialog's unticked "Delete local copies of
+    added files"). */
 export async function gitDiscard(
   host: Host,
   root: string,
   changes: readonly Pick<GitChange, 'path' | 'status' | 'staged' | 'from'>[],
   options: { keepAdded?: boolean } = {},
 ): Promise<{ path: string; error: string | null }[]> {
-  const results: { path: string; error: string | null }[] = []
-  for (const change of changes) {
-    const step = discardStep(change)
-    try {
-      switch (step.kind) {
-        case 'delete': {
-          const [result] = await coderDelete(host, [joinPath(root, step.path)], false)
-          if (result && !result.success) throw new Error(result.error?.message ?? 'delete failed')
-          break
-        }
-        case 'unstage-delete': {
-          await gitUnstage(host, root, [step.path])
-          if (options.keepAdded) break
-          const [result] = await coderDelete(host, [joinPath(root, step.path)], false)
-          if (result && !result.success) throw new Error(result.error?.message ?? 'delete failed')
-          break
-        }
-        case 'restore-rename': {
-          await run(host, root, ['restore', '--source=HEAD', '--staged', '--worktree', '--', step.from], 'git restore')
-          await gitUnstage(host, root, [step.path])
-          const [result] = await coderDelete(host, [joinPath(root, step.path)], false)
-          if (result && !result.success) throw new Error(result.error?.message ?? 'delete failed')
-          break
-        }
-        case 'restore':
-          await run(host, root, ['restore', '--source=HEAD', '--staged', '--worktree', '--', step.path], 'git restore')
-          break
-      }
-      results.push({ path: change.path, error: null })
-    } catch (error) {
-      results.push({
-        path: change.path,
-        error: error instanceof Error ? error.message : String(error),
+  const steps = changes.map(discardStep)
+  const failed = new Map<string, string>()
+  await discardBatch(
+    steps.flatMap((step) =>
+      step.kind === 'restore'
+        ? [{ change: step.path, path: step.path }]
+        : step.kind === 'restore-rename'
+          ? [{ change: step.path, path: step.from }]
+          : [],
+    ),
+    async (paths) => {
+      await run(host, root, ['restore', '--source=HEAD', '--staged', '--worktree', '--', ...paths], 'git restore')
+      return []
+    },
+    failed,
+  )
+  await discardBatch(
+    steps
+      .filter((step) => step.kind === 'unstage-delete' || step.kind === 'restore-rename')
+      .map((step) => ({ change: step.path, path: step.path })),
+    async (paths) => {
+      await gitUnstage(host, root, paths)
+      return []
+    },
+    failed,
+  )
+  await discardBatch(
+    steps
+      .filter((step) => step.kind !== 'restore' && !(options.keepAdded && step.kind === 'unstage-delete'))
+      .map((step) => ({ change: step.path, path: step.path })),
+    async (paths) => {
+      const results = await coderDelete(host, paths.map((path) => joinPath(root, path)), false)
+      return paths.map((_, index) => {
+        const result = results[index]
+        return result && !result.success ? (result.error?.message ?? 'delete failed') : null
       })
+    },
+    failed,
+  )
+  return changes.map((change) => ({ path: change.path, error: failed.get(change.path) ?? null }))
+}
+
+/** One discard step over many paths, each tied to the change it undoes.
+    `call` fails outright, or resolves to the failures it can name per path
+    (by index; none listed means none failed). */
+async function discardBatch(
+  targets: readonly { change: string; path: string }[],
+  call: (paths: string[]) => Promise<readonly (string | null)[]>,
+  failed: Map<string, string>,
+): Promise<void> {
+  const live = targets.filter((target) => !failed.has(target.change))
+  if (live.length === 0) return
+  try {
+    const errors = await call(live.map((target) => target.path))
+    live.forEach((target, index) => {
+      const error = errors[index]
+      if (error) failed.set(target.change, error)
+    })
+  } catch (error) {
+    if (live.length === 1) {
+      failed.set(live[0].change, error instanceof Error ? error.message : String(error))
+      return
     }
+    for (const target of live) await discardBatch([target], call, failed)
   }
-  return results
 }
 
 /** Commit what is staged. */
@@ -295,6 +341,67 @@ export async function gitStashDrop(host: Host, root: string, ref: string): Promi
 /** Check out a new branch at the stash's base and apply it there; drops the stash on success. */
 export async function gitStashBranch(host: Host, root: string, name: string, ref: string): Promise<void> {
   await run(host, root, ['stash', 'branch', name.trim(), ref], 'git stash branch')
+}
+
+/** The repository's top level: `git apply` below it skips the paths
+    outside the folder it runs in. */
+async function topOf(host: Host, cwd: string): Promise<string> {
+  return (await run(host, cwd, ['rev-parse', '--show-toplevel'], 'git rev-parse')).stdout.trim()
+}
+
+const inRepo = (paths: readonly string[]) => paths.map((path) => `:(top,literal)${path}`)
+
+/** What commit `sha` changed in `paths` (repository-relative), as a patch
+    against its first parent (everything for a root commit), binary files
+    included and untouched by local diff settings. */
+export async function gitCommitPatch(host: Host, cwd: string, sha: string, paths: readonly string[]): Promise<string> {
+  const flags = ['--format=', '--binary', '--no-color', '--no-ext-diff', '--no-textconv', '--diff-merges=first-parent']
+  const patch = await run(host, cwd, ['show', ...flags, sha, '--', ...inRepo(paths)], 'git show')
+  if (patch.stdout_truncated) throw new Error('the changes are too large to use here')
+  if (patch.stdout.trim() === '') throw new Error('the commit changed none of these files')
+  return patch.stdout
+}
+
+/** Applies what commit `sha` changed in `paths` to the working tree only,
+    or undoes it (`reverse`): a cherry-pick or a revert of those files,
+    neither staged nor committed. The patch applies whole or not at all,
+    so a file edited since refuses it rather than half-changing. */
+export async function gitApplyCommitChanges(
+  host: Host,
+  cwd: string,
+  sha: string,
+  paths: readonly string[],
+  reverse: boolean,
+): Promise<void> {
+  if (paths.length === 0) return
+  const top = await topOf(host, cwd)
+  const patch = await gitCommitPatch(host, top, sha, paths)
+  const args = ['apply', ...(reverse ? ['-R'] : []), '--whitespace=nowarn']
+  const out = await git(host, top, args, undefined, { stdin: patch })
+  const message = failure(out, 'git apply')
+  if (message !== null) throw new Error(message)
+}
+
+/** Puts `paths` in the working tree as they are at `sha`, a path absent
+    there removed; the index stays. What was in those files is lost. */
+export async function gitRestoreFrom(host: Host, cwd: string, sha: string, paths: readonly string[]): Promise<void> {
+  if (paths.length === 0) return
+  const top = await topOf(host, cwd)
+  // A path neither the index nor the commit knows is either gone already
+  // (the commit deleted it, and so does the working tree) or a file made
+  // again since and never added, which is not git's to remove: git restore
+  // refuses both with a bare pathspec error, so tell them apart.
+  const known = await run(host, top, ['ls-files', '-z', `--with-tree=${sha}`, '--', ...inRepo(paths)], 'git ls-files')
+  const listed = new Set(known.stdout.split('\0'))
+  const unknown = paths.filter((path) => !listed.has(path))
+  if (unknown.length > 0) {
+    const others = await run(host, top, ['ls-files', '-z', '--others', '--', ...inRepo(unknown)], 'git ls-files')
+    const onDisk = others.stdout.split('\0').find(Boolean)
+    if (onDisk !== undefined) throw new Error(`${basename(onDisk)} is not tracked: left as is`)
+  }
+  const restorable = paths.filter((path) => listed.has(path))
+  if (restorable.length === 0) return
+  await run(host, top, ['restore', `--source=${sha}`, '--worktree', '--', ...inRepo(restorable)], 'git restore')
 }
 
 export interface GitTagSummary {

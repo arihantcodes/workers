@@ -6,6 +6,7 @@ import {
   gitDiscard,
   gitFileAtRef,
   gitPush,
+  gitRestoreFrom,
   gitStashPush,
   gitTags,
   gitUnstage,
@@ -56,8 +57,12 @@ describe('discardStep', () => {
 })
 
 describe('gitDiscard', () => {
-  it('restores tracked files from HEAD and reports per-file failures', async () => {
-    const { host, calls } = hostWith(reply(), reply({ exit_code: 1, stderr: 'error: pathspec nope' }))
+  it('restores tracked files from HEAD and, when the batch fails, reports per-file failures', async () => {
+    const { host, calls } = hostWith(
+      reply({ exit_code: 1, stderr: 'error: pathspec nope' }),
+      reply(),
+      reply({ exit_code: 1, stderr: 'error: pathspec nope' }),
+    )
     const results = await gitDiscard(host, '/r', [
       { path: 'a.ts', status: 'modified', staged: false },
       { path: 'nope.ts', status: 'deleted', staged: false },
@@ -66,11 +71,38 @@ describe('gitDiscard', () => {
       { path: 'a.ts', error: null },
       { path: 'nope.ts', error: 'error: pathspec nope' },
     ])
-    expect(calls[0]).toMatchObject({
+    expect(calls.map((call) => (call as { args: string[] }).args.slice(5))).toEqual([
+      ['a.ts', 'nope.ts'],
+      ['a.ts'],
+      ['nope.ts'],
+    ])
+    expect(calls[1]).toMatchObject({
       command: 'git',
       args: ['restore', '--source=HEAD', '--staged', '--worktree', '--', 'a.ts'],
       cwd: '/r',
     })
+  })
+
+  it('discards many files in one call per step, in each change’s order', async () => {
+    const { host, calls, trigger } = hostWith(reply(), reply(), {
+      results: [{ success: true }, { success: false, error: { code: 'io', message: 'busy' } }, { success: true }],
+    })
+    const results = await gitDiscard(host, '/r', [
+      { path: 'm.ts', status: 'modified', staged: false },
+      { path: 'new.ts', status: 'untracked', staged: false },
+      { path: 'add.ts', status: 'added', staged: true },
+      { path: 'b.ts', status: 'renamed', staged: true, from: 'a.ts' },
+    ])
+    expect(trigger).toHaveBeenCalledTimes(3)
+    expect((calls[0] as { args: string[] }).args.slice(4)).toEqual(['--', 'm.ts', 'a.ts'])
+    expect((calls[1] as { args: string[] }).args).toEqual(['restore', '--staged', '--', 'add.ts', 'b.ts'])
+    expect(calls[2]).toEqual({ paths: ['/r/new.ts', '/r/add.ts', '/r/b.ts'], recursive: false })
+    expect(results).toEqual([
+      { path: 'm.ts', error: null },
+      { path: 'new.ts', error: null },
+      { path: 'add.ts', error: 'busy' },
+      { path: 'b.ts', error: null },
+    ])
   })
 
   it('deletes untracked files through coder::delete-file', async () => {
@@ -263,5 +295,31 @@ describe('retrying a held index lock', () => {
     await vi.runAllTimersAsync()
     await outcome
     expect(moved.calls).toHaveLength(3)
+  })
+})
+
+describe('gitRestoreFrom', () => {
+  it('restores a path the index or the commit knows, from the top', async () => {
+    const { host, calls } = hostWith(reply({ stdout: '/r\n' }), reply({ stdout: 'src/b.ts\0' }), reply())
+    await gitRestoreFrom(host, '/r/sub', 'abc1234', ['src/b.ts'])
+    expect(calls.map((call) => (call as { args: string[]; cwd: string }).args)).toEqual([
+      ['rev-parse', '--show-toplevel'],
+      ['ls-files', '-z', '--with-tree=abc1234', '--', ':(top,literal)src/b.ts'],
+      ['restore', '--source=abc1234', '--worktree', '--', ':(top,literal)src/b.ts'],
+    ])
+    expect(calls[2]).toMatchObject({ cwd: '/r' })
+  })
+
+  it('says a path neither knows is left as is, rather than reporting a restore', async () => {
+    // The commit deleted it and it was made again since, never added.
+    const { host, calls } = hostWith(reply({ stdout: '/r\n' }), reply(), reply({ stdout: 'src/D.ts\0' }))
+    await expect(gitRestoreFrom(host, '/r', 'abc1234', ['src/D.ts'])).rejects.toThrow('D.ts is not tracked: left as is')
+    expect(calls).toHaveLength(3)
+  })
+
+  it('has nothing to do for a path the commit deleted and the working tree has not', async () => {
+    const { host, calls } = hostWith(reply({ stdout: '/r\n' }), reply(), reply())
+    await gitRestoreFrom(host, '/r', 'abc1234', ['src/D.ts'])
+    expect(calls.map((call) => (call as { args: string[] }).args[0])).toEqual(['rev-parse', 'ls-files', 'ls-files'])
   })
 })

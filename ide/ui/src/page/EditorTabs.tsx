@@ -2,7 +2,8 @@
    Code's semantics and chrome. A file tab shows its type icon and the
    name coloured by Git status; a diff tab shows the same name with a
    small chip naming what it compares (Staged, Changes, a turn, a
-   revision), so two diffs of one file read apart at a glance. Preview
+   revision), so two diffs of one file read apart at a glance. A file as
+   a commit left it reads `name @ abc1234`. Preview
    tabs are italic, a dirty file shows a dot where the close button sits,
    middle-click closes, the wheel scrolls the strip, and a right-click
    menu carries the usual close verbs plus copy path, reveal and compare.
@@ -10,7 +11,7 @@
 
 import { Tooltip } from '@iii-dev/console-ui'
 import { GitCompareArrows, SquareTerminal, X } from 'lucide-react'
-import { useCallback, useEffect, useRef } from 'react'
+import { memo, useCallback, useEffect, useRef } from 'react'
 import { anchorFromEvent, type ContextMenuItem, useContextMenu } from './ContextMenu'
 import { diffSourceLabel } from './diff-source'
 import { FileTypeIcon } from './file-type-icon'
@@ -50,7 +51,7 @@ interface EditorTabsProps {
   onOpenFile: (path: string) => void
 }
 
-export function EditorTabs({
+function EditorTabsView({
   tabs,
   dirtyPaths,
   missingPaths,
@@ -85,6 +86,8 @@ export function EditorTabs({
       const index = tabs.tabs.findIndex((t) => t.id === tab.id)
       const hasRight = index !== -1 && index < tabs.tabs.length - 1
       const path = tab.target.path
+      // A commit's file outside the IDE's folder: a diff, nothing to open.
+      const outside = path.startsWith('../')
       return [
         { id: 'close', label: 'Close', onSelect: () => onClose(tab.id) },
         { id: 'close-others', label: 'Close others', disabled: tabs.tabs.length < 2, onSelect: () => onCloseOthers(tab.id) },
@@ -93,14 +96,14 @@ export function EditorTabs({
         { id: 'close-all', label: 'Close all', onSelect: onCloseAll },
         { type: 'separator', id: 's1' },
         ...(!tab.pinned ? [{ id: 'keep', label: 'Keep open', onSelect: () => onPin(tab.id) } satisfies ContextMenuItem] : []),
-        ...(tab.target.kind === 'diff'
+        ...(tab.target.kind !== 'file' && !outside
           ? [{ id: 'open-file', label: 'Open the file', onSelect: () => onOpenFile(path) } satisfies ContextMenuItem]
           : []),
         { id: 'copy-path', label: 'Copy path', onSelect: () => onCopyPath(path, true) },
         { id: 'copy-rel', label: 'Copy relative path', onSelect: () => onCopyPath(path, false) },
         { type: 'separator', id: 's2' },
-        { id: 'reveal', label: 'Reveal in explorer', onSelect: () => onReveal(path) },
-        { id: 'compare', label: 'Compare with', onSelect: () => onCompare(path) },
+        { id: 'reveal', label: 'Reveal in explorer', disabled: outside, onSelect: () => onReveal(path) },
+        { id: 'compare', label: 'Compare with', disabled: outside, onSelect: () => onCompare(path) },
       ]
     },
     [tabs.tabs, onClose, onCloseOthers, onCloseRight, onCloseSaved, onCloseAll, onPin, onCopyPath, onReveal, onCompare, onOpenFile],
@@ -123,8 +126,11 @@ export function EditorTabs({
         const isFile = tab.target.kind === 'file'
         const dirty = isFile && dirtyPaths.has(path)
         const missing = isFile && (missingPaths?.has(path) ?? false)
-        const status = gitStatus.get(path)
+        // A commit's version never changes: the working copy's status is not its own.
+        const status = tab.target.kind === 'revision' ? undefined : gitStatus.get(path)
         const name = basename(path)
+        const revision = tab.target.kind === 'revision' ? tab.target.sha.slice(0, 7) : null
+        const label = revision === null ? name : `${name} @ ${revision}`
         const chip =
           tab.target.kind === 'diff'
             ? diffSourceLabel(
@@ -156,23 +162,31 @@ export function EditorTabs({
               className="open"
               role="tab"
               aria-selected={active}
-              title={missing ? `${path} (not found on disk)` : chip ? `${path} (${chip})` : path}
+              title={
+                missing
+                  ? `${path} (not found on disk)`
+                  : chip
+                    ? `${path} (${chip})`
+                    : revision !== null
+                      ? `${path} @ ${revision} (read-only)`
+                      : path
+              }
               onClick={() => onActivate(tab.id)}
               onDoubleClick={() => onPin(tab.id)}
             >
-              {isFile ? (
-                <FileTypeIcon path={path} className="shui-etab-file-icon" />
-              ) : (
+              {tab.target.kind === 'diff' ? (
                 <GitCompareArrows aria-hidden className="shui-etab-icon diff" />
+              ) : (
+                <FileTypeIcon path={path} className="shui-etab-file-icon" />
               )}
-              <span className="label">{name}</span>
+              <span className="label">{label}</span>
               {chip ? <span className="shui-etab-chip">{chip}</span> : null}
             </button>
-            <Tooltip label={dirty ? `Close ${name} (unsaved changes)` : `Close ${name}`}>
+            <Tooltip label={dirty ? `Close ${name} (unsaved changes)` : `Close ${label}`}>
               <button
                 type="button"
                 className="close"
-                aria-label={`close ${name}`}
+                aria-label={`close ${label}`}
                 onClick={(event) => {
                   event.stopPropagation()
                   onClose(tab.id)
@@ -202,3 +216,6 @@ export function EditorTabs({
     </div>
   )
 }
+
+/** Memoized: the page re-renders often, and this only when its props change. */
+export const EditorTabs = memo(EditorTabsView)
