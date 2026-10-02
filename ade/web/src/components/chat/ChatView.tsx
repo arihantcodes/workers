@@ -1526,6 +1526,9 @@ export function ChatView({
         try {
           await ensureSession(conversationId, payload.text)
         } catch (err) {
+          // Nothing was sent: the text goes back into the composer (and into
+          // the new chat's saved draft) rather than being lost with the error.
+          restoreDraft(payload)
           onAppendMessage(
             conversationId,
             makeSystemNotice(

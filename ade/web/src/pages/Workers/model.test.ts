@@ -3,6 +3,7 @@ import type { ContainerEntry, DeclaredContainer } from './compose-api'
 import {
   alsoStarts,
   arrangeCheckouts,
+  defaultRun,
   dependentsOf,
   draftFrom,
   entryShape,
@@ -370,5 +371,17 @@ describe('alsoStarts', () => {
       'Also starts harness-e2e, stopped now',
     ])
     expect(alsoStarts(['web'], ['web'])).toEqual([])
+  })
+})
+
+describe('defaultRun', () => {
+  it('offers cargo run of the binary a Rust worker builds, nothing for the rest', () => {
+    expect(defaultRun({ name: 'judge', language: 'rust', bin: null })).toBe(
+      'cargo run --locked --bin judge',
+    )
+    expect(
+      defaultRun({ name: 'judge', language: 'rust', bin: 'judge-typesafe' }),
+    ).toBe('cargo run --locked --bin judge-typesafe')
+    expect(defaultRun({ name: 'web', language: 'node', bin: null })).toBe('')
   })
 })
