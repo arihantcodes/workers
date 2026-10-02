@@ -1230,7 +1230,7 @@ dependencies = [
 
 [[package]]
 name = "provider-deepseek"
-version = "0.1.16"
+version = "0.1.17"
 dependencies = [
  "clap",
  "futures",
