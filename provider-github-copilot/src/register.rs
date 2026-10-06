@@ -13,6 +13,7 @@ use iii_sdk::protocol::RegisterTriggerInput;
 use iii_sdk::{IIIClient, RegisterFunction};
 use llm_router::provider_scaffold::aborts::{make_abort, StreamAborts};
 use llm_router::provider_scaffold::registration::typed_async_with_bad_request;
+use llm_router::types::model::ThinkingLevel;
 use llm_router::types::router::{
     ProviderDeclaration, ProviderDefaults, ProviderReadyAck, RouterReadyEvent,
 };
@@ -22,14 +23,15 @@ use std::time::Duration;
 
 /// Env var carrying a GitHub OAuth token as a login-less fallback (the
 /// worker's own auth chain reads it; the router never holds a credential
-/// for this provider).
+/// for this provider, so the declaration names no env var).
 pub const CREDENTIAL_ENV_VAR: &str = "GITHUB_COPILOT_OAUTH_TOKEN";
 
 pub fn declaration() -> ProviderDeclaration {
     ProviderDeclaration {
         id: PROVIDER_ID.into(),
         display_name: Some("GitHub Copilot".into()),
-        credential_env_var: Some(CREDENTIAL_ENV_VAR.into()),
+        // Copilot owns its authentication (device flow), like Codex.
+        credential_env_var: None,
         defaults: Some(ProviderDefaults {
             // Deliberately no api_url default: the router's resolve step
             // falls back to this value when the operator has not set one, and
@@ -50,6 +52,16 @@ pub fn declaration() -> ProviderDeclaration {
         // unless marked write-only).
         config_schema: None,
         supports_model_listing: Some(true),
+        // Starting point for callers that name no model: the current
+        // mid-range model first, then its predecessors (router picks the
+        // first one the live catalog holds).
+        default_models: Some(vec![
+            "copilot/gpt-6.1-sol".into(),
+            "copilot/gpt-6-sol".into(),
+        ]),
+        default_thinking_level: Some(ThinkingLevel::Minimal),
+        context_overflow_hint: None,
+        credential_optional: None,
         // No static slice: GET /models is the source of truth once a login
         // exists, and a refresh fires right after registration.
         models: None,
@@ -258,11 +270,11 @@ mod tests {
     }
 
     #[test]
-    fn declaration_uses_credential_env_var_const() {
+    fn declaration_owns_its_authentication() {
+        // The device-flow token lives in this worker's state and the worker
+        // reads GITHUB_COPILOT_OAUTH_TOKEN itself; declaring the env var would
+        // make consoles treat Copilot as an API-key provider with no key.
         assert_eq!(super::CREDENTIAL_ENV_VAR, "GITHUB_COPILOT_OAUTH_TOKEN");
-        assert_eq!(
-            declaration().credential_env_var.as_deref(),
-            Some(super::CREDENTIAL_ENV_VAR)
-        );
+        assert_eq!(declaration().credential_env_var, None);
     }
 }

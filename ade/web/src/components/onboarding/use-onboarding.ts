@@ -20,6 +20,7 @@ import {
   type KeyDetection,
   type PlanStep,
   type ProviderState,
+  servesUsableModels,
   type ToolScan,
 } from '@/lib/onboarding/plan'
 import { envFileName, getSecretsStatus } from '@/lib/secrets'
@@ -96,18 +97,19 @@ export function withWorkerPresence(
 
 /**
  * Chat models the router serves right now from providers whose worker is
- * connected — the wizard's own reading. Throws when the router or the
- * engine cannot answer.
+ * connected and whose models are usable (`servesUsableModels`) — the
+ * wizard's own reading. An unconfigured key provider can still list models,
+ * but the picker cannot use them, so they do not count. Throws when the
+ * router or the engine cannot answer.
  */
 export async function connectedModelCount(): Promise<number> {
   const [providers, installed] = await Promise.all([
     readProviderStates(),
     installedWorkerNames(),
   ])
-  return withWorkerPresence(providers, installed).reduce(
-    (sum, provider) => sum + provider.modelCount,
-    0,
-  )
+  return withWorkerPresence(providers, installed)
+    .filter(servesUsableModels)
+    .reduce((sum, provider) => sum + provider.modelCount, 0)
 }
 
 /** Every env var the wizard can reuse: provider keys and the hosted judge's. */

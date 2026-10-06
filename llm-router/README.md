@@ -61,7 +61,7 @@ partial content, so consumers never hang on a half-open stream.
 | `router::transcribe` | Speech to text: `{model?, provider?, audio_base64, mime?, language?, prompt?}` → `{provider, model, text, segments[]?, language?, duration_secs?}`. The provider comes from the named `provider`, else from the catalog owner of the `stt` model, else the first provider that declared one. |
 | `router::speak` | Text to speech: `{model?, provider?, text, voice?, format?, language?, speed?}` → `{provider, model, audio_base64, mime, voice?, duration_secs?}`. Same resolution over `tts` models. |
 | `router::count_tokens` | Count prompt tokens: `{model, provider?, system_prompt?, tools?, messages}` → `{provider, model, tokens, estimator}`, resolved with the same routing rules as `router::chat` and forwarded to `provider::<id>::count_tokens`. Never runs the model and costs nothing; `estimator` is `provider` (metering API) or `tiktoken` (local tokenizer). A provider without the surface is a typed `router/no_token_counter` error, so callers can fall back to their own estimate. |
-| `router::provider::list` | Registered providers with `configured` / `available` status and where each credential comes from (`credential_source`, `credential_ref`, `credential_error` — never a value). |
+| `router::provider::list` | Registered providers with `configured` / `available` status, where each credential comes from (`credential_source`, `credential_ref`, `credential_error` — never a value), and each provider's starting point: `default_model` and `default_thinking_level` (see [Default model](#default-model)). |
 
 Only the read surface is agent-callable (`router::models::list` / `get` /
 `supports`, `router::provider::list`); everything else is denied to in-run
@@ -308,6 +308,10 @@ A provider worker must:
    echoes it in `router::provider::list` and the console paints it as a
    `currentColor` mask beside the provider's models; a missing or malformed
    mark falls back to the provider's initial.
+   The declaration may also carry `default_models`, the provider's
+   recommended starting models in preference order (the current mid-range
+   model first, then its predecessors), and `default_thinking_level`, the
+   level to pair with it; see [Default model](#default-model).
 3. Resolve credentials per request via `router::provider::resolve`; never
    read keys directly. A response with `credential_source: "secret"` and no
    credential is an unresolvable `secret://` or `env://` reference: report its
@@ -324,6 +328,51 @@ system_prompt?, tools?, messages}` → `{model, tokens, estimator}`) to serve
 (`estimator: "provider"`) or a local tokenizer estimate (`estimator:
 "tiktoken"`). Providers without it simply make `router::count_tokens` return
 a typed `router/no_token_counter` error for that provider.
+
+### Default model
+
+`router::provider::list` reports one `default_model` per provider so that a
+caller with no model choice of its own (a fresh `harness::send` naming only
+a provider, a console opening its first chat) starts on something sensible.
+It is resolved at read time against the provider's current catalog slice:
+
+1. the first id in the declared `default_models` the slice holds;
+2. otherwise the slice model sharing the longest id prefix with the first
+   preference, as long as they share the family (the id up to its first
+   `-`: `claude`, `gpt`, `codex/gpt`). On a tie the highest version wins
+   (`gpt-4.1` over `gpt-4o`), then the plain id over a dated snapshot or a
+   `-mini` variant;
+3. otherwise absent, and the caller keeps its previous behaviour.
+
+A provider that declares no `default_models` (local model servers, speech
+providers) never reports one. `default_thinking_level` is copied from the
+declaration; absent means the caller should omit the level and let the
+provider apply its own default.
+
+A declaration may also carry `context_overflow_hint`: one or two plain
+sentences a console shows under a context-overflow failure on one of the
+provider's models, for causes compacting cannot fix (a self-hosted server
+started with a small window, say), optionally with a link to the provider's
+docs. `router::provider::list` reports it verbatim; absent means the console
+shows only its generic steps.
+
+A provider that works without a key (a local server started without one)
+declares `credential_optional: true`. The router then reports it
+`configured` when no credential resolves; a key that is set is still
+resolved and sent. Absent or `false` means a key is required.
+
+### Thinking levels
+
+`router::chat` takes `thinking_level`: `off`, `minimal`, `low`, `medium`,
+`high` or `xhigh`. Each provider maps a level onto its own knob and warns
+when a model cannot honour it. `off` asks for no reasoning at all and is
+honoured only where the model's descriptor says `supports_thinking_off:
+true` (a native switch exists: OpenAI `reasoning_effort: none` on the
+models that take it, DeepSeek and GLM `thinking.type: disabled`, Anthropic
+Sonnet 5.5 `between_tools`). `false` means the model always reasons or the
+provider has no switch; absent means the provider does not know. Consoles
+offer, hide or disable the Off choice accordingly. A provider that cannot
+switch reasoning off sends its lowest effort instead and reports a warning.
 
 ### Speech providers
 

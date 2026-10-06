@@ -1,5 +1,6 @@
 import { ChevronDown, ChevronRight, RefreshCw } from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
+import { DeviceSignIn } from '@/components/chat/DeviceSignIn'
 import { ProviderIcon } from '@/components/chat/ProviderIcon'
 import { Button } from '@/components/ui/Button'
 import { Checkbox } from '@/components/ui/Checkbox'
@@ -58,7 +59,7 @@ export function ModelsStep({
   const { snapshot, scanning, refresh, activity, running, run } = onboarding
   const [registry, setRegistry] = useState<RegistryProviderRow[]>([])
   const [drafts, setDrafts] = useState<ReadonlyMap<string, Draft>>(new Map())
-  const [showMore, setShowMore] = useState(false)
+  const [showMore, setShowMore] = useState(true)
   const [connected, setConnected] = useState(false)
 
   useEffect(() => {
@@ -88,15 +89,12 @@ export function ModelsStep({
   )
 
   // Recommended choices start selected; the user's own clicks win after.
-  const draftFor = (choice: ProviderChoice): Draft => {
-    const draft = drafts.get(choice.providerId)
-    if (draft) return draft
-    return {
+  const draftFor = (choice: ProviderChoice): Draft =>
+    resolveDraft(drafts.get(choice.providerId), {
       selected: choice.recommended && !choice.ready && usable(choice),
       key:
         choice.kind === 'key' ? defaultKeyInput(choice.detection) : undefined,
-    }
-  }
+    })
   const update = (choice: ProviderChoice, next: Partial<Draft>) =>
     setDrafts((current) =>
       new Map(current).set(choice.providerId, { ...draftFor(choice), ...next }),
@@ -139,7 +137,7 @@ export function ModelsStep({
     const ok = await run('models', plan)
     if (ok) {
       setConnected(true)
-      setDrafts(new Map())
+      setDrafts(draftsAfterConnect)
     }
   }
 
@@ -156,42 +154,66 @@ export function ModelsStep({
             !usable(choice) && 'opacity-60',
           )}
         >
-          <Checkbox
-            aria-label={`Connect ${choice.title}`}
-            checked={draft.selected}
-            disabled={disabled}
-            onChange={(event) =>
-              update(choice, { selected: event.currentTarget.checked })
-            }
-            className="mt-1.5"
-          />
+          {choice.kind === 'device' ? (
+            // Signs in on its own below, not through Connect.
+            <span className="mt-1.5 size-4 shrink-0" aria-hidden />
+          ) : (
+            <Checkbox
+              aria-label={`Connect ${choice.title}`}
+              checked={draft.selected}
+              disabled={disabled}
+              onChange={(event) =>
+                update(choice, { selected: event.currentTarget.checked })
+              }
+              className="mt-1.5"
+            />
+          )}
           <ProviderIcon
             label={choice.title}
-            className="mt-1.5 size-4 text-ink-faint"
+            className="mt-1.5 size-4 text-ink"
           />
           <span className="flex min-w-0 flex-1 flex-col gap-0.5">
             <span className="flex flex-wrap items-center gap-2">
-              <span className="font-sans text-[13px] font-medium text-ink">
+              <span className="font-sans text-[14px] font-medium text-ink">
                 {choice.title}
               </span>
               {tool?.installed && !tool.signed_in ? (
                 <StatusChip tone="warn">Not signed in</StatusChip>
-              ) : choice.kind === 'subscription' ? (
+              ) : choice.kind === 'subscription' || choice.kind === 'device' ? (
                 <StatusChip tone="neutral">No API key</StatusChip>
               ) : null}
             </span>
-            <span className="text-pretty font-sans text-[12px] leading-relaxed text-ink-faint">
+            <span className="text-pretty font-sans text-[13px] leading-relaxed text-ink">
               {choice.reason}
             </span>
-            {tool?.installed ? <ToolDetails tool={tool} /> : null}
-            {!choice.installed ? (
-              <span className="font-mono text-[11px] text-ink-ghost">
+            {tool?.installed || tool?.signed_in ? (
+              <ToolDetails tool={tool} />
+            ) : null}
+            {!choice.installed && choice.kind !== 'device' ? (
+              <span className="font-mono text-[12px] text-ink">
                 adds {choice.worker}
                 {version ? `@${version}` : ''}
               </span>
             ) : null}
           </span>
         </div>
+        {choice.kind === 'device' ? (
+          <div className="px-3 pb-3 pl-10">
+            <DeviceSignIn
+              provider={choice.provider}
+              installed={choice.installed}
+              onConnected={() =>
+                void run('models', [
+                  {
+                    kind: 'wait-models',
+                    providerId: choice.providerId,
+                    title: choice.title,
+                  },
+                ])
+              }
+            />
+          </div>
+        ) : null}
         {draft.selected && choice.kind === 'key' ? (
           <KeyField
             envVar={choice.provider.envVar}
@@ -262,7 +284,7 @@ export function ModelsStep({
       />
 
       {snapshot.toolsError ? (
-        <p className="font-sans text-[12px] text-alert-strong">
+        <p className="font-sans text-[13px] text-alert-strong">
           Could not scan this machine: {snapshot.toolsError}
         </p>
       ) : null}
@@ -277,9 +299,9 @@ export function ModelsStep({
               >
                 <ProviderIcon
                   label={choice.title}
-                  className="size-4 text-ink-faint"
+                  className="size-4 text-ink"
                 />
-                <span className="flex-1 font-sans text-[13px] text-ink">
+                <span className="flex-1 font-sans text-[14px] text-ink">
                   {choice.title}
                 </span>
                 <StatusChip tone="ok">
@@ -317,7 +339,7 @@ export function ModelsStep({
       ) : null}
 
       {!firstScan && snapshot.detections !== null && !keysFound ? (
-        <p className="rounded-md bg-surface px-3 py-3 font-sans text-[13px] text-ink-faint">
+        <p className="rounded-md bg-surface px-3 py-3 font-sans text-[14px] text-ink">
           No provider keys in your shell profile or this project's{' '}
           {snapshot.envFile}. Paste one below, or sign in to a coding agent and
           scan again.
@@ -362,21 +384,38 @@ export function ModelsStep({
   )
 }
 
+/**
+ * After Connect: every checkbox stays as the person left it — a recommended
+ * choice they unchecked must not come back checked — and typed keys are
+ * dropped, so a key is not kept in memory once stored.
+ */
+export function draftsAfterConnect(
+  drafts: ReadonlyMap<string, Draft>,
+): ReadonlyMap<string, Draft> {
+  return new Map(
+    [...drafts].map(([id, draft]) => [id, { selected: draft.selected }]),
+  )
+}
+
+/** The person's draft over the default; a dropped key falls back to it. */
+export function resolveDraft(draft: Draft | undefined, fallback: Draft): Draft {
+  if (!draft) return fallback
+  return { ...draft, key: draft.key ?? fallback.key }
+}
+
 /** Where the coding agent's CLI and its sign-in live — paths, never content. */
 function ToolDetails({ tool }: { tool: ToolScan }) {
   const cli = [tool.binary_path, tool.version].filter(Boolean).join(' · ')
   return (
     <>
       {tool.signed_in && tool.credentials_path ? (
-        <span className="truncate font-sans text-[12px] text-ink-faint">
+        <span className="truncate font-sans text-[13px] text-ink">
           Sign-in at{' '}
-          <span className="font-mono text-[11px]">{tool.credentials_path}</span>
+          <span className="font-mono text-[12px]">{tool.credentials_path}</span>
         </span>
       ) : null}
       {cli ? (
-        <span className="truncate font-mono text-[11px] text-ink-ghost">
-          {cli}
-        </span>
+        <span className="truncate font-mono text-[12px] text-ink">{cli}</span>
       ) : null}
     </>
   )
@@ -388,11 +427,12 @@ function usable(choice: ProviderChoice): boolean {
 }
 
 /**
- * A coding agent installed here but not signed in: one sign-in and a rescan
- * from usable, so it stays beside the recommendations, saying what to do,
- * instead of in the long tail.
+ * A coding agent installed here but not signed in, or a provider that signs
+ * in from here (GitHub Copilot): one sign-in from usable, so it stays beside
+ * the recommendations, saying what to do, instead of in the long tail.
  */
 function oneSignInAway(choice: ProviderChoice): boolean {
+  if (choice.kind === 'device') return true
   return (
     choice.kind === 'subscription' &&
     !choice.usable &&

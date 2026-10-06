@@ -10,6 +10,7 @@ import {
   type ProviderChoice,
   providerChoices,
   registryChoices,
+  servesUsableModels,
   setPath,
   sourceLabel,
   type ToolScan,
@@ -70,6 +71,20 @@ describe('providerChoices', () => {
     )
   })
 
+  it('needs only the sign-in, not the CLI program (the desktop apps)', () => {
+    const choices = providerChoices({
+      tools: [
+        { ...signedIn('codex', 'provider-openai-codex'), installed: false },
+      ],
+      providers: [],
+      detections: [],
+    })
+    const codex = byId(choices, 'openai-codex')
+    expect(codex.recommended).toBe(true)
+    expect(codex.reason).toMatch(/signed in on this machine/)
+    expect(codex.reason).not.toMatch(/not found/)
+  })
+
   it('puts providers that already serve models first and marks them ready', () => {
     const choices = providerChoices({
       tools: [],
@@ -87,6 +102,108 @@ describe('providerChoices', () => {
     expect(choices[0].providerId).toBe('openai')
     expect(choices[0].ready).toBe(true)
     expect(choices[0].installed).toBe(true)
+  })
+
+  it('lists other running providers that serve models as connected', () => {
+    const choices = providerChoices({
+      tools: [],
+      providers: [
+        // Device flow: the router holds no credential, the worker does.
+        {
+          id: 'github-copilot',
+          title: 'GitHub Copilot',
+          configured: false,
+          ownsAuthentication: true,
+          available: true,
+          modelCount: 10,
+        },
+        // Keyless local server.
+        {
+          id: 'llamacpp',
+          title: 'llama.cpp',
+          configured: true,
+          available: true,
+          modelCount: 2,
+        },
+        // A key provider the wizard has no recipe for, with no key: its
+        // catalog is not usable, so it is not connected.
+        {
+          id: 'sarvam',
+          title: 'Sarvam',
+          configured: false,
+          available: true,
+          modelCount: 3,
+        },
+      ],
+      detections: [],
+    })
+    const copilot = byId(choices, 'github-copilot')
+    expect(copilot).toMatchObject({
+      ready: true,
+      installed: true,
+      worker: 'provider-github-copilot',
+      modelCount: 10,
+    })
+    expect(byId(choices, 'llamacpp').ready).toBe(true)
+    expect(choices.some((choice) => choice.providerId === 'sarvam')).toBe(false)
+  })
+})
+
+describe('device sign-in choices', () => {
+  it('offers GitHub Copilot with a browser sign-in until it serves models', () => {
+    const fresh = byId(
+      providerChoices({ tools: [], providers: [], detections: [] }),
+      'github-copilot',
+    )
+    expect(fresh).toMatchObject({
+      kind: 'device',
+      worker: 'provider-github-copilot',
+      ready: false,
+      installed: false,
+    })
+    expect(fresh.reason).toMatch(/GitHub/)
+
+    const signedIn = byId(
+      providerChoices({
+        tools: [],
+        providers: [
+          {
+            id: 'github-copilot',
+            title: 'GitHub Copilot',
+            configured: false,
+            ownsAuthentication: true,
+            available: true,
+            modelCount: 10,
+          },
+        ],
+        detections: [],
+      }),
+      'github-copilot',
+    )
+    expect(signedIn).toMatchObject({ kind: 'device', ready: true })
+  })
+})
+
+describe('servesUsableModels', () => {
+  it('needs models and either a credential or its own authentication', () => {
+    const state = {
+      id: 'x',
+      title: 'X',
+      available: true,
+      modelCount: 4,
+    }
+    expect(servesUsableModels({ ...state, configured: true })).toBe(true)
+    expect(
+      servesUsableModels({
+        ...state,
+        configured: false,
+        ownsAuthentication: true,
+      }),
+    ).toBe(true)
+    expect(servesUsableModels({ ...state, configured: false })).toBe(false)
+    expect(
+      servesUsableModels({ ...state, configured: true, modelCount: 0 }),
+    ).toBe(false)
   })
 })
 
@@ -249,17 +366,16 @@ describe('connectPlan', () => {
     const [extra] = registryChoices(
       [
         {
-          name: 'provider-github-copilot',
-          description:
-            'GitHub Copilot subscription provider worker; sign in once.',
+          name: 'provider-sarvam',
+          description: 'Sarvam provider worker; needs SARVAM_API_KEY.',
           version: '0.1.11',
         },
       ],
       new Set(),
       choices,
     )
-    expect(extra.title).toBe('Github Copilot')
-    expect(extra.reason).toBe('GitHub Copilot subscription provider worker')
+    expect(extra.title).toBe('Sarvam')
+    expect(extra.reason).toBe('Sarvam provider worker')
     expect(
       connectPlan([{ choice: extra }], new Set()).map((s) => s.kind),
     ).toEqual(['add-workers'])
@@ -369,21 +485,33 @@ describe('judgeFailure', () => {
 })
 
 describe('shouldAutoOpenOnboarding', () => {
-  it('opens by itself only for a person on first run', () => {
-    expect(shouldAutoOpenOnboarding({ status: 'new' }, false)).toBe(true)
+  it('opens on first run, whatever the router serves', () => {
+    // A signed-in Codex or a local llama.cpp server fills the catalog before
+    // setup; the person still sees the wizard once.
+    expect(shouldAutoOpenOnboarding({ status: 'new' }, false, null)).toBe(true)
+    expect(shouldAutoOpenOnboarding({ status: 'new' }, false, 5)).toBe(true)
+  })
+
+  it('opens again after setup only when no model is connected', () => {
+    for (const status of ['completed', 'dismissed', null]) {
+      expect(shouldAutoOpenOnboarding({ status }, false, 0)).toBe(true)
+      expect(shouldAutoOpenOnboarding({ status }, false, 3)).toBe(false)
+      // A router that cannot answer opens nothing.
+      expect(shouldAutoOpenOnboarding({ status }, false, null)).toBe(false)
+    }
+  })
+
+  it('never opens in a browser under automation', () => {
     // An e2e suite, an agent's browser session or a stories render.
-    expect(shouldAutoOpenOnboarding({ status: 'new' }, true)).toBe(false)
-    expect(shouldAutoOpenOnboarding({ status: 'dismissed' }, false)).toBe(false)
-    expect(shouldAutoOpenOnboarding({ status: 'completed' }, false)).toBe(false)
-    expect(shouldAutoOpenOnboarding({ status: null }, false)).toBe(false)
+    expect(shouldAutoOpenOnboarding({ status: 'new' }, true, 0)).toBe(false)
   })
 
   it('stays closed where the ADE turned auto-open off, as a deploy does', () => {
     expect(
-      shouldAutoOpenOnboarding({ status: 'new', auto_open: false }, false),
+      shouldAutoOpenOnboarding({ status: 'new', auto_open: false }, false, 0),
     ).toBe(false)
     expect(
-      shouldAutoOpenOnboarding({ status: 'new', auto_open: true }, false),
+      shouldAutoOpenOnboarding({ status: 'new', auto_open: true }, false, 0),
     ).toBe(true)
   })
 })
