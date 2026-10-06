@@ -55,7 +55,11 @@ const updateRequestSchema = z.object({
   ),
 })
 
-const deleteRequestSchema = z.object({ paths: z.array(z.string()) })
+const deleteRequestSchema = z.object({
+  paths: z.array(z.string()),
+  recursive: z.optional(z.boolean()),
+  include_protected: z.optional(z.boolean()),
+})
 
 export type FileChangeStatus = 'created' | 'updated' | 'deleted' | 'unchanged' | 'failed'
 
@@ -73,6 +77,9 @@ export interface FileChangeRow {
 export interface FileChangesSummary {
   action: 'created' | 'updated' | 'deleted'
   rows: FileChangeRow[]
+  /** A delete that also removes the protected files (.env, keys) under its
+      folders: said up front, above all on a call waiting for approval. */
+  protectedToo?: boolean
 }
 
 export function diffPanelRequest(row: FileChangeRow): PanelOpenRequest {
@@ -160,6 +167,8 @@ export function summarizeFileChanges(functionId: string, input: unknown, output?
     if (!req.success) return null
     return {
       action: 'deleted',
+      // The worker honors the flag only on a recursive delete.
+      ...(req.data.recursive === true && req.data.include_protected === true ? { protectedToo: true } : {}),
       rows: req.data.paths.map((path, index) => {
         const result = results[index]
         return {
