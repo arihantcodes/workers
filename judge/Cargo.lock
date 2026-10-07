@@ -846,7 +846,7 @@ dependencies = [
 
 [[package]]
 name = "judge"
-version = "0.2.4"
+version = "0.2.7"
 dependencies = [
  "anyhow",
  "clap",
