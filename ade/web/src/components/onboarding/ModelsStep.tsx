@@ -13,7 +13,6 @@ import {
   providerChoices,
   type RegistryProviderRow,
   registryChoices,
-  type ToolScan,
 } from '@/lib/onboarding/plan'
 import { cn } from '@/lib/utils'
 import { fetchRegistryProviders } from '@/lib/workers-registry'
@@ -22,12 +21,15 @@ import {
   defaultKeyInput,
   KeyField,
   keyInputReady,
+  NewWorkerNote,
   PlanPreview,
   Rows,
   Section,
   StatusChip,
   StepHeader,
   StepLayout,
+  type StepPosition,
+  stepEyebrow,
 } from './parts'
 import type { OnboardingController } from './use-onboarding'
 
@@ -49,10 +51,13 @@ const ROUTER_KEY_STORES = ['vault', 'env'] as const
  */
 export function ModelsStep({
   onboarding,
+  position,
   onBack,
   onNext,
 }: {
   onboarding: OnboardingController
+  /** Its place among the setup steps, for the "Step N of M" line. */
+  position?: StepPosition
   onBack: () => void
   onNext: () => void
 }) {
@@ -83,15 +88,13 @@ export function ModelsStep({
     () => registryChoices(registry, snapshot.installed, choices),
     [registry, snapshot.installed, choices],
   )
-  const versions = useMemo(
-    () => new Map(registry.map((row) => [row.name, row.version])),
-    [registry],
-  )
 
-  // Recommended choices start selected; the user's own clicks win after.
+  // Recommended choices start selected until a provider is connected; the
+  // user's own clicks win after.
+  const nothingConnected = !choices.some((choice) => choice.ready)
   const draftFor = (choice: ProviderChoice): Draft =>
     resolveDraft(drafts.get(choice.providerId), {
-      selected: choice.recommended && !choice.ready && usable(choice),
+      selected: preselected(choice, nothingConnected),
       key:
         choice.kind === 'key' ? defaultKeyInput(choice.detection) : undefined,
     })
@@ -143,7 +146,6 @@ export function ModelsStep({
 
   const renderChoice = (choice: ProviderChoice) => {
     const draft = draftFor(choice)
-    const version = versions.get(choice.worker)
     const disabled = busy || !usable(choice)
     const tool = choice.kind === 'subscription' ? choice.tool : null
     return (
@@ -186,14 +188,9 @@ export function ModelsStep({
             <span className="text-pretty font-sans text-[13px] leading-relaxed text-ink">
               {choice.reason}
             </span>
-            {tool?.installed || tool?.signed_in ? (
-              <ToolDetails tool={tool} />
-            ) : null}
+            {/* The device sign-in says it adds its worker itself. */}
             {!choice.installed && choice.kind !== 'device' ? (
-              <span className="font-mono text-[12px] text-ink">
-                adds {choice.worker}
-                {version ? `@${version}` : ''}
-              </span>
+              <NewWorkerNote workers={[choice.worker]} />
             ) : null}
           </span>
         </div>
@@ -264,9 +261,9 @@ export function ModelsStep({
       }
     >
       <StepHeader
-        eyebrow="Step 1 of 2"
+        eyebrow={stepEyebrow(position)}
         title="Connect a model"
-        lead="Pick at least one. What's recommended comes from what this machine already has: a coding agent you're signed in to needs no API key, and a key you've already exported is reused without copying it anywhere."
+        lead="Pick at least one. Recommended ones use what this machine already has: a coding agent you're signed in to needs no API key."
         action={
           <Button
             variant="ghost"
@@ -403,21 +400,18 @@ export function resolveDraft(draft: Draft | undefined, fallback: Draft): Draft {
   return { ...draft, key: draft.key ?? fallback.key }
 }
 
-/** Where the coding agent's CLI and its sign-in live — paths, never content. */
-function ToolDetails({ tool }: { tool: ToolScan }) {
-  const cli = [tool.binary_path, tool.version].filter(Boolean).join(' · ')
+/**
+ * Whether a choice starts checked. Recommendations are a starting point for
+ * the first connection only: once a provider is connected, coming back to
+ * this step (Back, or reopening setup) never re-checks the ones the person
+ * left out.
+ */
+export function preselected(
+  choice: ProviderChoice,
+  nothingConnected: boolean,
+): boolean {
   return (
-    <>
-      {tool.signed_in && tool.credentials_path ? (
-        <span className="truncate font-sans text-[13px] text-ink">
-          Sign-in at{' '}
-          <span className="font-mono text-[12px]">{tool.credentials_path}</span>
-        </span>
-      ) : null}
-      {cli ? (
-        <span className="truncate font-mono text-[12px] text-ink">{cli}</span>
-      ) : null}
-    </>
+    nothingConnected && choice.recommended && !choice.ready && usable(choice)
   )
 }
 
