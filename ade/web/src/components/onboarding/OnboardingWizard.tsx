@@ -1,5 +1,5 @@
 import { Check } from 'lucide-react'
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   Dialog,
   DialogContent,
@@ -7,15 +7,17 @@ import {
   DialogTitle,
 } from '@/components/ui/Dialog'
 import { Eyebrow } from '@/components/ui/Eyebrow'
+import { type AgentEntry, listAgents } from '@/lib/backend/directory-prompts'
 import { requestComposerFocus } from '@/lib/composer-insert'
 import { useConversationsCtxOptional } from '@/lib/conversations-context'
+import { getIiiClient } from '@/lib/iii-client'
 import {
   fetchOnboardingState,
   type OnboardingStatus,
-  readableError,
   saveOnboardingState,
 } from '@/lib/onboarding/api'
-import { type JudgeOption, TOUR_PAGE } from '@/lib/onboarding/catalog'
+import type { JudgeOption } from '@/lib/onboarding/catalog'
+import { chromiumMissing } from '@/lib/onboarding/chromium'
 import {
   browserIsAutomated,
   onOnboardingWizardRequest,
@@ -23,21 +25,40 @@ import {
   type WizardStepId,
 } from '@/lib/onboarding/open'
 import { servesUsableModels } from '@/lib/onboarding/plan'
-import { prepareTour } from '@/lib/onboarding/tour'
-import { requestPanelOpen } from '@/lib/panel-context'
+import {
+  type ExamplePrompt,
+  fetchExamplePrompts,
+} from '@/lib/onboarding/prompts'
 import { cn } from '@/lib/utils'
+import { BrowserStep } from './BrowserStep'
+import { openExamplePrompt } from './example-prompt'
 import { JudgeStep } from './JudgeStep'
 import { ModelsStep } from './ModelsStep'
-import { ReadyStep, type TourState } from './ReadyStep'
+import type { StepPosition } from './parts'
+import { ReadyStep } from './ReadyStep'
 import { connectedModelCount, useOnboarding } from './use-onboarding'
 import { WelcomeStep } from './WelcomeStep'
 
 const STEPS: { id: WizardStepId; title: string; optional?: boolean }[] = [
   { id: 'welcome', title: 'Welcome' },
   { id: 'models', title: 'Models' },
+  // Listed only while it has something to do (see `showBrowser`).
+  { id: 'browser', title: 'Browser', optional: true },
   { id: 'judge', title: 'Judge', optional: true },
   { id: 'ready', title: 'Ready' },
 ]
+
+/** "Step N of M" counts the steps that set something up. */
+export function stepPosition(
+  steps: readonly { id: WizardStepId }[],
+  id: WizardStepId,
+): StepPosition | undefined {
+  const setup = steps.filter(
+    (entry) => entry.id !== 'welcome' && entry.id !== 'ready',
+  )
+  const index = setup.findIndex((entry) => entry.id === id)
+  return index < 0 ? undefined : { index: index + 1, total: setup.length }
+}
 
 /**
  * The first-run setup wizard. Mounted once in `App`: it opens by itself the
@@ -51,9 +72,16 @@ const STEPS: { id: WizardStepId; title: string; optional?: boolean }[] = [
  * workspace layout in the ADE's data directory. After either, it reopens on
  * its own only while no model is connected.
  *
- * Once a model is connected, Ready offers the guided tour. Accepting adds
- * the `onboarding` worker that carries it — quietly: it is how the tour is
- * delivered, not a choice in setup — and opens its page beside the chat.
+ * The Browser step joins the list when the project runs the browser worker
+ * and the machine has no Chromium for it (or someone asks for it — the
+ * command palette's "Install Chromium", a chat error that says Chromium is
+ * missing), and stays listed once shown.
+ *
+ * Ready ends setup with Finish, and — once a model is connected — offers
+ * the example prompts the project's template declares (`onboarding.yaml`,
+ * read through `console::onboarding::prompts`): a click finishes setup and
+ * opens a new chat with the prompt waiting in the composer, its agent
+ * profile and model chosen (see `openExamplePrompt`).
  */
 export function OnboardingWizardHost() {
   const ctx = useConversationsCtxOptional()
@@ -64,15 +92,25 @@ export function OnboardingWizardHost() {
     () => new Set(['welcome']),
   )
   const [judge, setJudge] = useState<JudgeOption | null>(null)
-  const [tour, setTour] = useState<TourState>({ kind: 'idle' })
+  const [prompts, setPrompts] = useState<ExamplePrompt[] | null>(null)
+  const [agents, setAgents] = useState<AgentEntry[] | null>(null)
   const status = useRef<OnboardingStatus | null>(null)
+  const ctxRef = useRef(ctx)
+  ctxRef.current = ctx
   const refreshModels = ctx?.refreshModels
   const onboarding = useOnboarding(open, () => {
     // The composer's picker follows router events, but a provider that
     // registers between two of them would otherwise wait for the next one.
     void refreshModels?.()
   })
-  const busy = onboarding.running !== null || tour.kind === 'preparing'
+  const busy = onboarding.running !== null
+  const needsBrowser = chromiumMissing(onboarding.snapshot.browser)
+  const [browserListed, setBrowserListed] = useState(false)
+  useEffect(() => {
+    if (needsBrowser) setBrowserListed(true)
+  }, [needsBrowser])
+  const showBrowser = browserListed || needsBrowser || step === 'browser'
+  const steps = STEPS.filter((entry) => entry.id !== 'browser' || showBrowser)
 
   useEffect(() => {
     if (!live) return
@@ -108,6 +146,7 @@ export function OnboardingWizardHost() {
     () =>
       onOnboardingWizardRequest((target) => {
         const next = target ?? 'welcome'
+        if (next === 'browser') setBrowserListed(true)
         setStep(next)
         setVisited((current) => new Set([...current, next]))
         setOpen(true)
@@ -116,6 +155,7 @@ export function OnboardingWizardHost() {
   )
 
   const go = useCallback((next: WizardStepId) => {
+    if (next === 'browser') setBrowserListed(true)
     setStep(next)
     setVisited((current) => new Set([...current, next]))
   }, [])
@@ -152,34 +192,93 @@ export function OnboardingWizardHost() {
             .flatMap((entry) => entry.workers ?? []),
         ),
       ]
+      const chromiumInstalled = onboarding.activity.some(
+        (entry) => entry.group === 'browser' && entry.status === 'done',
+      )
       record('completed', {
         providers,
         judge: judgeChoice?.id ?? null,
         workers_added: workers,
+        chromium_installed: chromiumInstalled
+          ? (onboarding.snapshot.browser?.version ?? true)
+          : false,
       })
     },
-    [go, onboarding.activity, onboarding.snapshot.providers, record],
+    [
+      go,
+      onboarding.activity,
+      onboarding.snapshot.browser,
+      onboarding.snapshot.providers,
+      record,
+    ],
   )
 
-  const start = useCallback(() => {
-    setOpen(false)
-    window.requestAnimationFrame(requestComposerFocus)
-  }, [])
-
-  const startTour = useCallback(async () => {
-    setTour({ kind: 'preparing' })
-    try {
-      await prepareTour()
-    } catch (error) {
-      setTour({ kind: 'failed', error: readableError(error) })
+  // Ready reads the project's example prompts, and the agent profiles they
+  // name, each time it shows: the template's file may have changed since.
+  useEffect(() => {
+    if (!open || step !== 'ready') return
+    if (!live) {
+      setPrompts([])
       return
     }
-    setTour({ kind: 'idle' })
-    setOpen(false)
-    requestPanelOpen({ pageId: TOUR_PAGE })
-  }, [])
+    let cancelled = false
+    setPrompts(null)
+    void fetchExamplePrompts()
+      .catch(() => [])
+      .then((next) => {
+        if (!cancelled) setPrompts(next)
+      })
+    void getIiiClient()
+      .then(listAgents)
+      .catch(() => null)
+      .then((next) => {
+        if (!cancelled && next) setAgents(next)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [open, step, live])
 
-  const index = STEPS.findIndex((entry) => entry.id === step)
+  const agentNames = useMemo(
+    () =>
+      new Map(
+        (agents ?? []).map((entry) => [
+          entry.id,
+          entry.name.trim() || entry.id,
+        ]),
+      ),
+    [agents],
+  )
+
+  /** Close setup for good: it is complete, whichever way Ready was left. */
+  const finish = useCallback(() => {
+    setOpen(false)
+    if (status.current !== 'completed') record('completed')
+  }, [record])
+
+  const start = useCallback(() => {
+    finish()
+    window.requestAnimationFrame(requestComposerFocus)
+  }, [finish])
+
+  const startPrompt = useCallback(
+    async (prompt: ExamplePrompt) => {
+      finish()
+      // Profiles still loading (a quick click): ask for them once more.
+      const profiles =
+        agents ??
+        (await getIiiClient()
+          .then(listAgents)
+          .catch(() => []))
+      const api = ctxRef.current
+      if (!api) return
+      openExamplePrompt(api, prompt, profiles)
+      window.requestAnimationFrame(requestComposerFocus)
+    },
+    [agents, finish],
+  )
+
+  const index = steps.findIndex((entry) => entry.id === step)
   const content = useRef<HTMLDivElement>(null)
   // A new step moves the caret to its primary action, so the keyboard path
   // through setup is Enter, Enter, Enter.
@@ -223,7 +322,7 @@ export function OnboardingWizardHost() {
           <Eyebrow className="mb-3 px-2 text-[12px] text-ink">
             Set up the harness
           </Eyebrow>
-          {STEPS.map((entry, position) => {
+          {steps.map((entry, position) => {
             const current = entry.id === step
             const done = position < index || (entry.id === 'ready' && current)
             const reachable = !busy && visited.has(entry.id) && step !== 'ready'
@@ -264,13 +363,13 @@ export function OnboardingWizardHost() {
               role="progressbar"
               aria-label="Setup progress"
               aria-valuemin={1}
-              aria-valuemax={STEPS.length}
+              aria-valuemax={steps.length}
               aria-valuenow={index + 1}
               className="h-1 flex-1 overflow-hidden rounded-full bg-surface"
             >
               <span
                 className="block h-full rounded-full bg-ink transition-[width] duration-300"
-                style={{ width: `${((index + 1) / STEPS.length) * 100}%` }}
+                style={{ width: `${((index + 1) / steps.length) * 100}%` }}
               />
             </span>
           </div>
@@ -285,22 +384,32 @@ export function OnboardingWizardHost() {
           ) : step === 'models' ? (
             <ModelsStep
               onboarding={onboarding}
+              position={stepPosition(steps, 'models')}
               onBack={() => go('welcome')}
+              onNext={() => go(showBrowser ? 'browser' : 'judge')}
+            />
+          ) : step === 'browser' ? (
+            <BrowserStep
+              onboarding={onboarding}
+              position={stepPosition(steps, 'browser')}
+              onBack={() => go('models')}
               onNext={() => go('judge')}
             />
           ) : step === 'judge' ? (
             <JudgeStep
               onboarding={onboarding}
-              onBack={() => go('models')}
+              position={stepPosition(steps, 'judge')}
+              onBack={() => go(showBrowser ? 'browser' : 'models')}
               onNext={finishTo}
             />
           ) : (
             <ReadyStep
               onboarding={onboarding}
               judge={judge}
-              tour={tour}
-              onStartTour={() => void startTour()}
-              onStart={start}
+              prompts={prompts}
+              agentNames={agentNames}
+              onPrompt={(prompt) => void startPrompt(prompt)}
+              onFinish={start}
             />
           )}
         </div>

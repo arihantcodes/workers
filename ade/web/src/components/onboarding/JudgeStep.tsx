@@ -5,28 +5,34 @@ import {
   JUDGE_USES,
   type JudgeOption,
 } from '@/lib/onboarding/catalog'
-import { judgePlan, type KeyInput } from '@/lib/onboarding/plan'
+import { judgePlan, judgeWorkers, type KeyInput } from '@/lib/onboarding/plan'
 import { cn } from '@/lib/utils'
 import {
   ActivityLog,
   defaultKeyInput,
   KeyField,
   keyInputReady,
+  NewWorkerNote,
   PlanPreview,
   Rows,
   Section,
   StatusChip,
   StepHeader,
   StepLayout,
+  type StepPosition,
+  stepEyebrow,
 } from './parts'
 import type { OnboardingController } from './use-onboarding'
 
 export function JudgeStep({
   onboarding,
+  position,
   onBack,
   onNext,
 }: {
   onboarding: OnboardingController
+  /** Its place among the setup steps, for the "Step N of M" line. */
+  position?: StepPosition
   onBack: () => void
   /** `judge` is the option set up, `null` when skipped. */
   onNext: (judge: JudgeOption | null) => void
@@ -101,7 +107,7 @@ export function JudgeStep({
       }
     >
       <StepHeader
-        eyebrow="Step 2 of 2 · Optional"
+        eyebrow={stepEyebrow(position, true)}
         title="Let Judge make the small decisions"
         lead="Agents make many tiny choices along the way. Judge answers them with a model trained only for typed decisions, so your main model spends its tokens on the work itself."
       />
@@ -177,9 +183,16 @@ export function JudgeStep({
                       <span className="text-pretty font-sans text-[13px] leading-relaxed text-ink">
                         {option.summary}
                       </span>
-                      <span className="font-mono text-[12px] text-ink">
+                      <span className="font-sans text-[13px] text-ink">
                         {option.runs}
                       </span>
+                      {done ? null : (
+                        <NewWorkerNote
+                          workers={Object.keys(
+                            judgeWorkers(option, snapshot.installed),
+                          )}
+                        />
+                      )}
                     </span>
                   </label>
                   {checked && option.envVar && !done ? (
