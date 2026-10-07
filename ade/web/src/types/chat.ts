@@ -16,13 +16,24 @@ export interface ModelOption {
    * "assume it can" rather than refusing to send a picture on missing metadata.
    */
   supportsVision?: boolean
+  /**
+   * Whether `off` can switch the model's reasoning off. `true` offers Off,
+   * `false` hides it (the model always reasons or the provider has no
+   * switch), `undefined` means the router did not say: Off shows disabled.
+   */
+  supportsThinkingOff?: boolean
   reasoningEfforts?: ReasoningEffortOption[]
 }
 
 export interface ReasoningEffortOption {
   effort: string
   description?: string
+  /** Shown but not selectable: the catalog could not confirm it works. */
+  disabled?: boolean
 }
+
+/** The level that asks the provider not to reason at all. */
+export const THINKING_OFF: ThinkingLevel = 'off'
 
 /** Model-selected reasoning effort. `default` omits every effort override. */
 export type ThinkingLevel = string
@@ -38,6 +49,12 @@ export const THINKING_LEVELS: ThinkingLevel[] = [
 ]
 
 export const DEFAULT_THINKING_LEVEL: ThinkingLevel = 'default'
+
+/**
+ * A request, not a level: the harness resolves it to the model's lowest
+ * effort on the next send and the console then shows what it chose.
+ */
+export const THINKING_LOWEST: ThinkingLevel = 'lowest'
 
 export type Role = 'user' | 'assistant' | 'thought' | 'function-trigger'
 

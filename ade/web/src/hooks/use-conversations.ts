@@ -869,10 +869,25 @@ export function applyCatalogModelFallback(
   conversations: Conversation[],
   validModels: ReadonlySet<string>,
   fallbackModel: ModelId,
+  /** The catalog pick drafts received before a provider default was known;
+      untouched drafts still on it move to `fallbackModel`. */
+  interimModel: ModelId | null = null,
 ): Conversation[] {
   let changed = false
   const next = conversations.map((c) => {
-    if (c.model && validModels.has(c.model)) return c
+    if (c.model && validModels.has(c.model)) {
+      if (
+        interimModel &&
+        interimModel !== fallbackModel &&
+        c.draft &&
+        c.model === interimModel &&
+        c.messages.length === 0
+      ) {
+        changed = true
+        return { ...c, model: fallbackModel }
+      }
+      return c
+    }
     // A profile model is authoritative even when the live catalog no longer
     // advertises it. Directory deliberately keeps retired ids loadable so
     // the send path can surface the real resolution error; silently swapping
@@ -1541,6 +1556,8 @@ export function useConversations(
   catalogKeysForValidation?: readonly string[],
   catalogReady?: boolean,
   serverEnabled?: boolean,
+  /** Provider-declared starting model (`provider::id`), when one is known. */
+  preferredModel: ModelId | null = null,
 ): ConversationsApi {
   const catalogSig =
     catalogKeysForValidation && catalogKeysForValidation.length > 0
@@ -1571,6 +1588,7 @@ export function useConversations(
     saveNewChatDraft('')
   }, [])
   const [activeId, setActiveId] = useState<string | null>(() => loadActiveId())
+  const interimModelRef = useRef<ModelId | null>(null)
   const [connectionState, setConnectionState] = useState<IIIConnectionState>(
     serverEnabled ? 'connecting' : 'connected',
   )
@@ -2525,15 +2543,22 @@ export function useConversations(
     if (catalogReady === false) return
     const keys = catalogSig.split('\u0001')
     const valid = new Set(keys)
-    const fallback = keys[0]
+    // A provider's declared default beats the alphabetically first key.
+    const preferred =
+      preferredModel && valid.has(preferredModel) ? preferredModel : null
+    const fallback = preferred ?? keys[0]
+    // The provider list can land after the catalog; remember the interim
+    // pick so drafts still on it follow the provider default when it arrives.
+    const interim = interimModelRef.current
+    interimModelRef.current = preferred ? null : fallback
     setConversations((prev) => {
-      return applyCatalogModelFallback(prev, valid, fallback)
+      return applyCatalogModelFallback(prev, valid, fallback, interim)
     })
     const lastModel = loadLastModel()
     if (lastModel && !valid.has(lastModel)) {
       saveLastModel(fallback)
     }
-  }, [catalogSig, catalogReady])
+  }, [catalogSig, catalogReady, preferredModel])
 
   useEffect(() => {
     saveActiveId(activeId)
@@ -2571,7 +2596,7 @@ export function useConversations(
         return pending.id
       }
       const next = emptyConversation(
-        loadLastModel(),
+        loadLastModel() ?? preferredModel,
         loadLastThinkingLevel() ?? DEFAULT_THINKING_LEVEL,
         draft,
       )
@@ -2579,7 +2604,7 @@ export function useConversations(
       setActiveId(next.id)
       return next.id
     },
-    [conversations, activeId],
+    [conversations, activeId, preferredModel],
   )
 
   const select = useCallback((id: string) => {

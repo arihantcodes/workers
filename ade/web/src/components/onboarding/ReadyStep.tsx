@@ -3,6 +3,7 @@ import { useEffect, useState } from 'react'
 import { Button } from '@/components/ui/Button'
 import { Wordmark } from '@/components/ui/Wordmark'
 import type { JudgeOption } from '@/lib/onboarding/catalog'
+import { servesUsableModels } from '@/lib/onboarding/plan'
 import { Section, StepLayout } from './parts'
 import type { OnboardingController } from './use-onboarding'
 
@@ -54,9 +55,7 @@ export function ReadyStep({
   onStart: () => void
 }) {
   const { snapshot, activity } = onboarding
-  const connected = (snapshot.providers ?? []).filter(
-    (provider) => provider.modelCount > 0,
-  )
+  const connected = (snapshot.providers ?? []).filter(servesUsableModels)
   const totalModels = connected.reduce(
     (sum, provider) => sum + provider.modelCount,
     0,
@@ -110,7 +109,7 @@ export function ReadyStep({
     <StepLayout
       footer={
         <>
-          <span className="hidden font-sans text-[12px] text-ink-faint @2xl:inline">
+          <span className="hidden font-sans text-[13px] text-ink @2xl:inline">
             Reopen this from the command palette: Set up the harness.
           </span>
           {offerTour ? (
@@ -146,13 +145,13 @@ export function ReadyStep({
       <div className="flex flex-col items-center gap-4 pt-2 text-center">
         <Wordmark appearance="assemble" className="size-14" />
         <div className="flex flex-col items-center gap-1.5">
-          <h2 className="onboarding-rise font-sans text-[22px] font-semibold tracking-[-0.01em] text-ink [animation-delay:520ms]">
+          <h2 className="onboarding-rise font-sans text-[24px] font-semibold tracking-[-0.01em] text-ink [animation-delay:520ms]">
             {connected.length > 0 ? 'Your harness is ready' : 'You’re all set'}
           </h2>
-          <p className="onboarding-rise font-sans text-[13px] text-ink-faint [animation-delay:600ms]">
+          <p className="onboarding-rise font-sans text-[14px] text-ink [animation-delay:600ms]">
             {connected.length > 0 ? (
               <>
-                <span className="font-mono text-[15px] font-medium tabular-nums text-ink">
+                <span className="font-mono text-[16px] font-medium tabular-nums text-ink">
                   {counted}
                 </span>{' '}
                 {totalModels === 1 ? 'model' : 'models'} from {connected.length}{' '}
@@ -181,11 +180,11 @@ export function ReadyStep({
                 <Check className="size-4" aria-hidden />
               </span>
               <span className="flex min-w-0 flex-col">
-                <span className="font-sans text-[13px] font-medium text-ink">
+                <span className="font-sans text-[14px] font-medium text-ink">
                   {line.title}
                 </span>
                 {line.detail ? (
-                  <span className="font-sans text-[12px] text-ink-faint">
+                  <span className="font-sans text-[13px] text-ink">
                     {line.detail}
                   </span>
                 ) : null}
@@ -197,7 +196,7 @@ export function ReadyStep({
 
       {added.length > 0 ? (
         <Section title={`Workers added during setup (${added.length})`}>
-          <p className="font-sans text-[12px] leading-relaxed text-ink-faint">
+          <p className="font-sans text-[13px] leading-relaxed text-ink">
             Each one is declared in{' '}
             <span className="font-mono">worker-compose.yaml</span>, so the
             project starts the same way on the next{' '}
@@ -207,7 +206,7 @@ export function ReadyStep({
             {added.map((worker) => (
               <span
                 key={worker}
-                className="rounded-sm bg-surface px-2 py-1 font-mono text-[11px] text-ink"
+                className="rounded-sm bg-surface px-2 py-1 font-mono text-[12px] text-ink"
               >
                 {worker}
               </span>
@@ -225,10 +224,10 @@ export function ReadyStep({
             <Compass className="size-4" aria-hidden />
           </span>
           <span className="flex min-w-0 flex-col gap-1">
-            <h3 className="font-sans text-[13px] font-semibold text-ink">
+            <h3 className="font-sans text-[14px] font-semibold text-ink">
               Keep going with a guided tour
             </h3>
-            <p className="text-pretty font-sans text-[12px] leading-relaxed text-ink-faint">
+            <p className="text-pretty font-sans text-[13px] leading-relaxed text-ink">
               It runs right here in the ADE, with the models you just connected,
               one stage at a time: send your first message, then watch the agent
               add a worker, call your backend's functions, react to a trigger
@@ -238,7 +237,7 @@ export function ReadyStep({
             {tour.kind === 'failed' ? (
               <p
                 role="alert"
-                className="font-sans text-[12px] text-alert-strong"
+                className="font-sans text-[13px] text-alert-strong"
               >
                 The tour could not start: {tour.error}
               </p>

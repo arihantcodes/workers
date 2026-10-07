@@ -16,7 +16,7 @@ use crate::policy;
 use crate::prompt::{self, SystemPromptStrategy};
 use crate::turn_loop;
 use crate::types::message::{AgentMessage, UserMessage, UserRoleTag};
-use crate::types::model::ThinkingLevel;
+use crate::types::model::{Model, ProviderDefaults, ThinkingLevel};
 use crate::types::output::OutputContract;
 use crate::types::turn::{
     FunctionContractLedgerEntry, FunctionPolicy, IdemRecord, ParentLink, SkillContext, TurnOptions,
@@ -94,6 +94,13 @@ pub struct SendOptions {
     /// Provider-native per-call options, namespaced by provider id.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_options: Option<BTreeMap<String, Value>>,
+    /// Ask the harness to pick the effort from the model's catalog row
+    /// instead of naming one: `lowest` is the model's lowest reasoning effort
+    /// (never `off`), or the provider default when the model offers no effort
+    /// choices. Exclusive with `thinking_level` and `provider_options`; the
+    /// choice is returned as `reasoning` on the send response.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<ReasoningPreset>,
     /// The turn's deliverable; default `{ type: "text" }`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output: Option<OutputContract>,
@@ -150,6 +157,68 @@ pub struct SendRequest {
     pub options: Option<SendOptions>,
 }
 
+/// An effort the harness resolves from the model's catalog row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningPreset {
+    Lowest,
+}
+
+/// What a `reasoning` preset resolved to for this send. `reasoning_effort`
+/// is the provider-native effort (the catalog's own string); both fields are
+/// absent when the model offers no effort choices and the provider decides.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct ResolvedReasoning {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_level: Option<ThinkingLevel>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+}
+
+/// The model's lowest reasoning effort. A catalog effort list is in
+/// ascending order, so its first entry other than `none` wins; a model that
+/// only says it can reason takes the lowest shared level, `minimal`; anything
+/// else gets no effort at all.
+fn lowest_reasoning(model: &Model) -> ResolvedReasoning {
+    let native = model
+        .reasoning_efforts
+        .iter()
+        .flatten()
+        .map(|effort| effort.effort.trim())
+        .find(|effort| !effort.is_empty() && *effort != "none" && *effort != "off");
+    match native {
+        Some(effort) => ResolvedReasoning {
+            thinking_level: serde_json::from_value(Value::String(effort.to_lowercase())).ok(),
+            reasoning_effort: Some(effort.to_string()),
+        },
+        None if model.supports_thinking == Some(true)
+            && model.reasoning_efforts.as_ref().is_none_or(Vec::is_empty) =>
+        {
+            ResolvedReasoning {
+                thinking_level: Some(ThinkingLevel::Minimal),
+                reasoning_effort: None,
+            }
+        }
+        None => ResolvedReasoning::default(),
+    }
+}
+
+/// Apply a resolved preset to the turn's reasoning fields: the native effort
+/// rides under the model's provider, exactly as an explicit send would.
+fn apply_resolved_reasoning(
+    options: &mut TurnOptions,
+    provider: &str,
+    resolved: &ResolvedReasoning,
+) {
+    options.thinking_level = resolved.thinking_level;
+    options.provider_options = resolved.reasoning_effort.as_ref().map(|effort| {
+        BTreeMap::from([(
+            provider.to_string(),
+            serde_json::json!({ "reasoning_effort": effort }),
+        )])
+    });
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SendResponse {
     pub session_id: String,
@@ -165,6 +234,9 @@ pub struct SendResponse {
     /// True when `idempotency_key` matched an earlier send.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deduplicated: Option<bool>,
+    /// What `options.reasoning` resolved to; absent when the send named none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<ResolvedReasoning>,
 }
 
 /// The shared result of starting (or merging) a turn.
@@ -174,6 +246,8 @@ pub struct StartOutcome {
     pub merged: bool,
     pub queued: bool,
     pub deduplicated: bool,
+    /// What `options.reasoning` resolved to, when the send named a preset.
+    pub reasoning: Option<ResolvedReasoning>,
 }
 
 pub async fn handle(deps: &Deps, req: SendRequest) -> Result<SendResponse, HarnessError> {
@@ -209,6 +283,7 @@ async fn handle_with_delivery_lock(
         merged: out.merged.then_some(true),
         queued: out.queued.then_some(true),
         deduplicated: out.deduplicated.then_some(true),
+        reasoning: out.reasoning,
     })
 }
 
@@ -293,32 +368,21 @@ async fn start_with_delivery_lock(
     let agent_route = agent
         .as_ref()
         .and_then(|profile| profile.model_and_provider());
-    let (model, provider) = match (agent_route, req.model.clone(), &prev) {
-        (Some((model, profile_provider)), _, _) => {
-            (model, profile_provider.or_else(|| req.provider.clone()))
-        }
-        (None, Some(model), _) => (model, req.provider.clone()),
-        (None, None, Some(prev)) => (
-            prev.options.model.clone(),
-            req.provider
-                .clone()
-                .or_else(|| prev.options.provider.clone()),
-        ),
-        (None, None, None) if req.session_id.is_some() => {
-            return Err(HarnessError::InvalidRequest(
-                "harness::send without `model` inherits from the session's prior \
-                 turn, but this session has none — name a `model`"
-                    .into(),
-            ))
-        }
-        (None, None, None) => {
-            return Err(HarnessError::InvalidRequest(
-                "harness::send creating a NEW session requires `model` (steering an \
-                 existing session may omit it)"
-                    .into(),
-            ))
-        }
+    // A send naming only a provider starts on that provider's declared
+    // default model (router-checked against its live catalog). One router
+    // round trip, and only on the path that would otherwise fail.
+    let provider_defaults = match (&agent_route, &req.model, &prev, &req.provider) {
+        (None, None, None, Some(provider)) => deps.router().await.provider_defaults(provider).await,
+        _ => None,
     };
+    let (model, provider) = resolve_model_route(
+        agent_route,
+        &req,
+        prev.as_ref().map(|p| &p.options),
+        provider_defaults
+            .as_ref()
+            .and_then(|d| d.default_model.clone()),
+    )?;
 
     // Freeze the per-send options before moving the message out of `req`.
     let inherits_prompt = prev.is_some() && prompt_fields_omitted(req.options.as_ref());
@@ -330,6 +394,12 @@ async fn start_with_delivery_lock(
         crate::prompt::effective_default(&deps.iii).await.identity
     };
     let mut options = build_options(&cfg, &req, model, provider, agent.as_ref(), &identity);
+    // A new session that names neither reasoning field starts on the
+    // provider's declared default level (`None` keeps today's "provider
+    // decides"). An existing session inherits its prior turn's instead.
+    if prev.is_none() && options.thinking_level.is_none() && options.provider_options.is_none() {
+        options.thinking_level = provider_default_thinking(deps, &options, provider_defaults).await;
+    }
     options.functions = functions;
     if let (true, Some(prev)) = (inherits_prompt, prev.as_ref()) {
         inherit_prior_system_prompt(&mut options, &prev.options);
@@ -340,6 +410,33 @@ async fn start_with_delivery_lock(
     ) {
         inherit_prior_reasoning(&mut options, &prev.options);
     }
+    let resolved_reasoning = match req.options.as_ref().and_then(|o| o.reasoning) {
+        Some(ReasoningPreset::Lowest) => {
+            if !reasoning_fields_omitted(req.options.as_ref()) {
+                return Err(HarnessError::InvalidRequest(
+                    "options.reasoning names the effort itself; send it without \
+                     thinking_level or provider_options"
+                        .into(),
+                ));
+            }
+            let model = deps
+                .router()
+                .await
+                .models_get(options.provider.as_deref(), &options.model)
+                .await
+                .ok_or_else(|| {
+                    HarnessError::InvalidRequest(format!(
+                        "options.reasoning: no catalog row for model {}",
+                        options.model
+                    ))
+                })?;
+            let resolved = lowest_reasoning(&model);
+            let provider = options.provider.clone().unwrap_or(model.provider);
+            apply_resolved_reasoning(&mut options, &provider, &resolved);
+            Some(resolved)
+        }
+        None => None,
+    };
     // A profile's skills are PRELOADED into its prompt (agents.rs), never a
     // filter: only an explicit `options.skills` narrows the skills index.
     prepare_skill_context(
@@ -446,7 +543,10 @@ async fn start_with_delivery_lock(
         let _ = crate::state::put_idem(&deps.iii, key, &rec, cfg.session_timeout_ms).await;
     }
 
-    Ok(outcome)
+    Ok(StartOutcome {
+        reasoning: resolved_reasoning,
+        ..outcome
+    })
 }
 
 /// Label the send's own root span with the message preview. The turn step
@@ -736,6 +836,7 @@ async fn try_enqueue(
                     merged: true,
                     queued: true,
                     deduplicated: false,
+                    reasoning: None,
                 }
             }
         }
@@ -971,6 +1072,73 @@ pub(crate) fn message_preview(message: &AgentMessage) -> Option<String> {
     (!preview.is_empty()).then_some(preview)
 }
 
+/// The model and provider a send runs on. A profile's model is
+/// authoritative (Console locks its picker to the same value; this
+/// server-side precedence keeps other callers from running the identity on
+/// a different model, and catalog keys may carry `provider::model`, split
+/// before routing). Then an explicit `model`, then the prior turn's, then
+/// the named provider's declared default. A new session with none of those
+/// is an error: the harness never picks a provider.
+fn resolve_model_route(
+    agent_route: Option<(String, Option<String>)>,
+    req: &SendRequest,
+    prev: Option<&TurnOptions>,
+    provider_default_model: Option<String>,
+) -> Result<(String, Option<String>), HarnessError> {
+    Ok(match (agent_route, req.model.clone(), prev) {
+        (Some((model, profile_provider)), _, _) => {
+            (model, profile_provider.or_else(|| req.provider.clone()))
+        }
+        (None, Some(model), _) => (model, req.provider.clone()),
+        (None, None, Some(prev)) => (
+            prev.model.clone(),
+            req.provider.clone().or_else(|| prev.provider.clone()),
+        ),
+        (None, None, None) if provider_default_model.is_some() => (
+            provider_default_model.expect("checked by the guard"),
+            req.provider.clone(),
+        ),
+        (None, None, None) if req.session_id.is_some() => {
+            return Err(HarnessError::InvalidRequest(
+                "harness::send without `model` inherits from the session's prior \
+                 turn, but this session has none — name a `model` (or a `provider` \
+                 that declares a default model)"
+                    .into(),
+            ))
+        }
+        (None, None, None) => {
+            return Err(HarnessError::InvalidRequest(
+                "harness::send creating a NEW session requires `model`, or a `provider` \
+                 that declares a default model (steering an existing session may omit both)"
+                    .into(),
+            ))
+        }
+    })
+}
+
+/// The provider's declared default thinking level, for a new session whose
+/// send names neither reasoning field. `provider_defaults` is reused when the
+/// model resolution already fetched it; otherwise the model's catalog entry
+/// names the provider.
+async fn provider_default_thinking(
+    deps: &Deps,
+    options: &TurnOptions,
+    provider_defaults: Option<ProviderDefaults>,
+) -> Option<ThinkingLevel> {
+    if let Some(defaults) = provider_defaults {
+        return defaults.default_thinking_level;
+    }
+    let router = deps.router().await;
+    let provider = match &options.provider {
+        Some(provider) => provider.clone(),
+        None => router.models_get(None, &options.model).await?.provider,
+    };
+    router
+        .provider_defaults(&provider)
+        .await?
+        .default_thinking_level
+}
+
 fn build_options(
     cfg: &WorkerConfig,
     req: &SendRequest,
@@ -1108,6 +1276,7 @@ fn resolve_send_gate(
             merged: false,
             queued: false,
             deduplicated: true,
+            reasoning: None,
         }));
     }
     validate_active_skill_request(active, skills_explicit)?;
@@ -1323,6 +1492,7 @@ async fn seed_or_merge(
                         merged: true,
                         queued: false,
                         deduplicated: false,
+                        reasoning: None,
                     })
                 }
                 recheck => {
@@ -1524,12 +1694,93 @@ pub(crate) async fn seed_new(
         merged: false,
         queued: false,
         deduplicated: false,
+        reasoning: None,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn catalog_model(row: serde_json::Value) -> Model {
+        let mut base = serde_json::json!({
+            "id": "m", "provider": "p", "context_window": 1000, "max_output_tokens": 100
+        });
+        base.as_object_mut()
+            .unwrap()
+            .extend(row.as_object().unwrap().clone());
+        serde_json::from_value(base).unwrap()
+    }
+
+    #[test]
+    fn lowest_takes_the_first_native_effort_other_than_none() {
+        // Codex: the API rejects `minimal`, so the ladder starts at `low`.
+        let codex = catalog_model(serde_json::json!({
+            "supports_thinking": true,
+            "reasoning_efforts": [{"effort": "low"}, {"effort": "medium"}, {"effort": "max"}]
+        }));
+        assert_eq!(
+            lowest_reasoning(&codex),
+            ResolvedReasoning {
+                thinking_level: Some(ThinkingLevel::Low),
+                reasoning_effort: Some("low".into()),
+            }
+        );
+        let with_none = catalog_model(serde_json::json!({
+            "supports_thinking": true,
+            "reasoning_efforts": [{"effort": "none"}, {"effort": "minimal"}, {"effort": "low"}]
+        }));
+        assert_eq!(
+            lowest_reasoning(&with_none).reasoning_effort.as_deref(),
+            Some("minimal")
+        );
+    }
+
+    #[test]
+    fn lowest_without_a_native_list_is_minimal_and_without_reasoning_is_default() {
+        let flag_only = catalog_model(serde_json::json!({ "supports_thinking": true }));
+        assert_eq!(
+            lowest_reasoning(&flag_only),
+            ResolvedReasoning {
+                thinking_level: Some(ThinkingLevel::Minimal),
+                reasoning_effort: None,
+            }
+        );
+        let fixed = catalog_model(serde_json::json!({ "supports_thinking": false }));
+        assert_eq!(lowest_reasoning(&fixed), ResolvedReasoning::default());
+        let unknown = catalog_model(serde_json::json!({}));
+        assert_eq!(lowest_reasoning(&unknown), ResolvedReasoning::default());
+    }
+
+    #[test]
+    fn a_resolved_native_effort_rides_under_the_provider() {
+        let mut options = bare_options();
+        options.thinking_level = Some(ThinkingLevel::High);
+        let resolved = ResolvedReasoning {
+            thinking_level: Some(ThinkingLevel::Low),
+            reasoning_effort: Some("low".into()),
+        };
+        apply_resolved_reasoning(&mut options, "openai-codex", &resolved);
+        assert_eq!(options.thinking_level, Some(ThinkingLevel::Low));
+        assert_eq!(
+            options.provider_options,
+            Some(BTreeMap::from([(
+                "openai-codex".to_string(),
+                serde_json::json!({ "reasoning_effort": "low" })
+            )]))
+        );
+        apply_resolved_reasoning(&mut options, "openai-codex", &ResolvedReasoning::default());
+        assert_eq!(options.thinking_level, None);
+        assert_eq!(options.provider_options, None);
+    }
+
+    #[test]
+    fn the_reasoning_preset_reads_lowest_on_the_wire() {
+        let options: SendOptions =
+            serde_json::from_value(serde_json::json!({ "reasoning": "lowest" })).unwrap();
+        assert_eq!(options.reasoning, Some(ReasoningPreset::Lowest));
+        assert!(reasoning_fields_omitted(Some(&options)));
+    }
     use iii_helpers::observability::opentelemetry::trace::{
         TraceContextExt, Tracer, TracerProvider,
     };
@@ -2898,6 +3149,70 @@ mod tests {
                 .unwrap_or_default()
                 .contains("# System rules"),
             "the built-in identity never rides under a profile"
+        );
+    }
+
+    fn provider_only_request(session_id: Option<&str>) -> SendRequest {
+        SendRequest {
+            session_id: session_id.map(String::from),
+            message: MessageInput::Text("hi".into()),
+            model: None,
+            provider: Some("anthropic".into()),
+            idempotency_key: None,
+            session: None,
+            options: None,
+        }
+    }
+
+    #[test]
+    fn a_provider_only_send_starts_on_the_providers_default_model() {
+        let req = provider_only_request(None);
+        let route = resolve_model_route(None, &req, None, Some("claude-sonnet-5-5".into()))
+            .expect("default model fills the gap");
+        assert_eq!(
+            route,
+            ("claude-sonnet-5-5".into(), Some("anthropic".into())),
+            "the default rides with the provider that declared it"
+        );
+        // A session with no prior turn is as new as a session-less send.
+        let req = provider_only_request(Some("s-1"));
+        let route = resolve_model_route(None, &req, None, Some("claude-sonnet-5-5".into()))
+            .expect("default model fills the gap");
+        assert_eq!(route.0, "claude-sonnet-5-5");
+    }
+
+    #[test]
+    fn explicit_and_profile_models_outrank_the_provider_default() {
+        let mut req = provider_only_request(None);
+        req.model = Some("claude-opus-5-5".into());
+        let route =
+            resolve_model_route(None, &req, None, Some("claude-sonnet-5-5".into())).unwrap();
+        assert_eq!(route.0, "claude-opus-5-5");
+        let profile = Some((
+            "codex/gpt-6.1-sol".to_string(),
+            Some("openai-codex".to_string()),
+        ));
+        let route =
+            resolve_model_route(profile, &req, None, Some("claude-sonnet-5-5".into())).unwrap();
+        assert_eq!(
+            route,
+            ("codex/gpt-6.1-sol".into(), Some("openai-codex".into())),
+            "a profile's provider wins over the request's"
+        );
+    }
+
+    #[test]
+    fn without_a_provider_default_the_old_errors_stand() {
+        let err = resolve_model_route(None, &provider_only_request(None), None, None).unwrap_err();
+        assert!(
+            matches!(&err, HarnessError::InvalidRequest(m) if m.contains("NEW session requires `model`")),
+            "{err:?}"
+        );
+        let err =
+            resolve_model_route(None, &provider_only_request(Some("s-1")), None, None).unwrap_err();
+        assert!(
+            matches!(&err, HarnessError::InvalidRequest(m) if m.contains("this session has none")),
+            "{err:?}"
         );
     }
 
