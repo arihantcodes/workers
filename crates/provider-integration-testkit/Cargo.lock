@@ -1461,7 +1461,7 @@ dependencies = [
 
 [[package]]
 name = "provider-anthropic"
-version = "1.2.23"
+version = "1.2.26"
 dependencies = [
  "clap",
  "futures",
