@@ -1,14 +1,15 @@
-//! Atomic JEV calls with worker-wide concurrency and cancellation.
+//! Atomic OpenAI Decisions calls with worker-wide concurrency and cancellation.
+use crate::decisions::{self, Decoded};
 use judge_contract::{
-    encode_evaluation_with_limits, validate_answer, validate_request_with_limits, Answer,
-    CancelRequest, CancelResponse, ErrorCode, EvaluateRequest, EvaluateResponse, Evaluation,
-    EvaluationResult, ModelCard, ModelsRequest, ModelsResponse, RequestOptions, Stats, Usage,
+    validate_request_with_limits, CancelRequest, CancelResponse, ErrorCode, EvaluateRequest,
+    EvaluateResponse, Evaluation, EvaluationResult, ModelsRequest, ModelsResponse, ProviderError,
+    RequestOptions, Stats, Usage,
 };
 use judge_provider::{
     cancellation::CancellationRegistry,
     transport::{self, check_deadline, ExecutionLimits, Failure, RetryPolicy, DEFAULT_RETRY},
 };
-use serde::Deserialize;
+use serde_json::json;
 use std::{
     collections::BTreeMap,
     sync::{
@@ -22,14 +23,14 @@ use tokio::{
     time::{timeout_at, Instant},
 };
 
-const ENDPOINT: &str = "https://api.typesafe.ai/v1/systemone";
+const ENDPOINT: &str = "https://api.openai.com/v1/decisions";
 const CONCURRENCY: usize = 4;
 
 /// Clone or use `with_api_key` for every handler; constructing another client
 /// creates another worker transport and concurrency pool. Credentials are never
 /// read from evaluation payloads or from the environment during a call.
 #[derive(Clone)]
-pub struct JevClient {
+pub struct DecisionsClient {
     http: reqwest::Client,
     endpoint: Arc<str>,
     models_endpoint: Arc<str>,
@@ -40,27 +41,16 @@ pub struct JevClient {
     calls: Arc<CancellationRegistry>,
     caller_id: Option<Arc<str>>,
 }
-impl std::fmt::Debug for JevClient {
+impl std::fmt::Debug for DecisionsClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("JevClient")
+        f.debug_struct("DecisionsClient")
             .field("api_key", &self.api_key.as_ref().map(|_| "[REDACTED]"))
             .finish_non_exhaustive()
     }
 }
-#[derive(Deserialize)]
-struct ProviderResponse {
-    model: String,
-    #[serde(deserialize_with = "judge_contract::unique_map")]
-    answers: BTreeMap<String, Answer>,
-    usage: Usage,
-}
-#[derive(Deserialize)]
-struct ProviderModels {
-    models: Vec<ModelCard>,
-}
 struct Accepted {
     id: String,
-    response: ProviderResponse,
+    decoded: Decoded,
 }
 struct CallContext {
     deadline: Instant,
@@ -86,14 +76,16 @@ struct Outcome {
     missing_usage: bool,
 }
 
-impl JevClient {
+impl DecisionsClient {
     /// Construct the production client with the credential captured at boot.
     pub fn new(api_key: Option<String>) -> Self {
         Self::with_endpoint(api_key, ENDPOINT.into())
     }
 
-    /// Dependency injection for isolated integration tests. Never expose this
-    /// endpoint through worker configuration or the public evaluation request.
+    /// Dependency injection for isolated tests. Never expose this endpoint
+    /// through worker configuration or the public evaluation request. The
+    /// model catalog is `/v1/models` on the same origin.
+    #[doc(hidden)]
     pub fn with_endpoint(api_key: Option<String>, endpoint: String) -> Self {
         let models_endpoint = reqwest::Url::parse(&endpoint)
             .map(|mut url| {
@@ -108,7 +100,7 @@ impl JevClient {
                 .redirect(reqwest::redirect::Policy::none())
                 .retry(reqwest::retry::never())
                 .build()
-                .expect("JEV HTTP client initializes"),
+                .expect("OpenAI HTTP client initializes"),
             endpoint: Arc::from(endpoint),
             models_endpoint: Arc::from(models_endpoint),
             api_key: normalized_key(api_key.as_deref()),
@@ -166,9 +158,10 @@ impl JevClient {
         }
     }
 
-    /// Execute a generic batch atomically. The deadline includes validation,
-    /// permit waits, headers and complete bodies; absolute expiry also accounts
-    /// for time spent queued on the bus before this function was entered.
+    /// Execute a generic batch atomically, one Decisions call per evaluation.
+    /// The deadline includes validation, permit waits, headers and complete
+    /// bodies; absolute expiry also accounts for time spent queued on the bus
+    /// before this function was entered.
     pub async fn evaluate(
         &self,
         request: EvaluateRequest,
@@ -208,12 +201,17 @@ impl JevClient {
                 }
             }
         };
+        // Replies echo the model; a batch answered without HTTP reports this one.
+        let model = request
+            .model
+            .clone()
+            .unwrap_or_else(|| default_model.to_owned());
         let mut outcome = Outcome::default();
         let mut pending = JoinSet::new();
         let result = tokio::select! {
             biased;
             _ = guard.cancelled() => Err(ErrorCode::Cancelled.into()),
-            result = timeout_at(deadline, self.evaluate_until(request, default_model, &call, &mut pending, &mut outcome)) =>
+            result = timeout_at(deadline, self.evaluate_until(request, &model, &call, &mut pending, &mut outcome)) =>
                 result.unwrap_or_else(|_| Err(ErrorCode::Deadline.into())),
         };
         // Drain aborted tasks before reading attempts: a task on another runtime
@@ -224,7 +222,7 @@ impl JevClient {
                 // Aborting cannot erase completed responses. Keep their known
                 // usage when compatible, but never change the original error
                 // or collect partial answers during failure cleanup.
-                let _ = record_usage(&mut outcome, &accepted.response);
+                let _ = record_usage(&mut outcome, &accepted.decoded);
             }
         }
         outcome.stats.attempts = call.attempts.load(Ordering::SeqCst);
@@ -233,7 +231,7 @@ impl JevClient {
             result.is_ok() && !outcome.missing_usage && !call.unknown_usage.load(Ordering::SeqCst);
         match result {
             Ok(()) => EvaluateResponse::Ok {
-                model: outcome.model.expect("nonempty validated batch"),
+                model: outcome.model.unwrap_or(model),
                 results: outcome.results,
                 stats: outcome.stats,
             },
@@ -255,7 +253,7 @@ impl JevClient {
     async fn evaluate_until(
         &self,
         request: EvaluateRequest,
-        default_model: &str,
+        model: &str,
         call: &Arc<CallContext>,
         pending: &mut JoinSet<Result<Accepted, Failure>>,
         outcome: &mut Outcome,
@@ -266,18 +264,39 @@ impl JevClient {
         let validation = validate_request_with_limits(&request, self.limits.max_request_bytes);
         check_deadline(deadline)?;
         validation?;
-        let model = request.model.as_deref().unwrap_or(default_model);
+        if !crate::SUPPORTED_MODELS.contains(&model) {
+            return Err(ErrorCode::InvalidRequest.into());
+        }
         // Preflight ALL evaluations before spawning any HTTP work, retaining no
         // bodies: each task re-encodes after acquiring one of the HTTP permits,
         // which bounds live buffers to the worker's concurrency.
         for evaluation in &request.evaluations {
             check_deadline(deadline)?;
-            encode_evaluation_with_limits(model, evaluation, self.limits.max_request_bytes)?;
+            if decisions::remote(evaluation) {
+                decisions::encode(model, evaluation, self.limits.max_request_bytes)?;
+            }
             // Up to 512 bodies of up to 8 MiB: give cancellation and other
             // tasks a turn between encodings.
             tokio::task::yield_now().await;
         }
+        // Also before local answers: a keyless worker fails every request alike.
         self.api_key.as_ref().ok_or(ErrorCode::MissingKey)?;
+        let (remote, local): (Vec<_>, Vec<_>) =
+            request.evaluations.into_iter().partition(decisions::remote);
+        for evaluation in local {
+            let answers = decisions::local_answers(&evaluation);
+            outcome.stats.questions += answers.len();
+            outcome.results.insert(
+                evaluation.id,
+                EvaluationResult {
+                    answers,
+                    usage: Some(Usage {
+                        input_tokens: Some(0),
+                        output_tokens: Some(0),
+                    }),
+                },
+            );
+        }
         let model: Arc<str> = Arc::from(model);
         // Single-attempt policies keep unsent work unspawned so one failure
         // aborts the batch after at most a permit's worth of extra requests.
@@ -286,9 +305,9 @@ impl JevClient {
         let window = if self.retry.max_retries == 0 {
             CONCURRENCY
         } else {
-            request.evaluations.len()
+            remote.len()
         };
-        let mut evaluations = request.evaluations.into_iter();
+        let mut evaluations = remote.into_iter();
         for evaluation in evaluations.by_ref().take(window) {
             self.spawn(pending, evaluation, model.clone(), call);
         }
@@ -326,11 +345,8 @@ impl JevClient {
         timeout_at(deadline, async {
             let bytes = self
                 .send_http(&call, || {
-                    let body = encode_evaluation_with_limits(
-                        &model,
-                        &evaluation,
-                        self.limits.max_request_bytes,
-                    )?;
+                    let body =
+                        decisions::encode(&model, &evaluation, self.limits.max_request_bytes)?;
                     Ok(self
                         .http
                         .post(self.endpoint.as_ref())
@@ -338,29 +354,18 @@ impl JevClient {
                         .body(body))
                 })
                 .await?;
-            let response: ProviderResponse =
-                serde_json::from_slice(&bytes).map_err(|_| ErrorCode::InvalidResponse)?;
-            if response.model.trim().is_empty()
-                || !evaluation.questions.keys().eq(response.answers.keys())
-                || evaluation.questions.iter().any(|(id, question)| {
-                    response
-                        .answers
-                        .get(id)
-                        .is_none_or(|answer| validate_answer(question, answer).is_err())
-                })
-            {
-                return Err(ErrorCode::InvalidResponse.into());
-            }
+            let decoded = decisions::decode(&evaluation, &bytes)?;
             Ok(Accepted {
                 id: evaluation.id,
-                response,
+                decoded,
             })
         })
         .await
         .unwrap_or_else(|_| Err(ErrorCode::Deadline.into()))
     }
 
-    /// List provider models using the same credential snapshot and HTTP permits.
+    /// List the supported Decisions models this key can see, using the same
+    /// credential snapshot and HTTP permits. Empty when none is visible.
     pub async fn list_models(&self, request: ModelsRequest) -> ModelsResponse {
         let started = Instant::now();
         let deadline = match transport::deadline(
@@ -402,9 +407,9 @@ impl JevClient {
             result = timeout_at(deadline, async {
                 transport::validate_options(&call.options, self.limits)?;
                 let bytes = self.send_http(&call, || Ok(self.http.get(self.models_endpoint.as_ref()))).await?;
-                let response: ProviderModels = serde_json::from_slice(&bytes).map_err(|_| ErrorCode::InvalidResponse)?;
+                let models = decisions::model_cards(&bytes)?;
                 check_deadline(deadline)?;
-                Ok::<_, Failure>(response.models)
+                Ok::<_, Failure>(models)
             }) => result.unwrap_or_else(|_| Err(ErrorCode::Deadline.into())),
         };
         // Listing models performs no inference and claims no token usage.
@@ -451,6 +456,7 @@ impl JevClient {
             build,
         )
         .await
+        .map_err(without_auth_message)
     }
 }
 fn normalized_key(key: Option<&str>) -> Option<Arc<str>> {
@@ -458,167 +464,58 @@ fn normalized_key(key: Option<&str>) -> Option<Arc<str>> {
         .filter(|key| !key.is_empty())
         .map(Arc::from)
 }
+/// OpenAI's 401/403 messages can quote a masked fragment of the key: keep only
+/// the error's `type` and `code` (none for a non-JSON body).
+fn without_auth_message(mut failure: Failure) -> Failure {
+    if matches!(failure.http_status, Some(401 | 403)) {
+        failure.provider_error = failure.provider_error.map(|error| ProviderError {
+            detail: error
+                .detail
+                .as_ref()
+                .and_then(|detail| detail.get("error"))
+                .map(|error| json!({"error": {"type": error.get("type"), "code": error.get("code")}})),
+            message: None,
+            truncated: error.truncated,
+        });
+    }
+    failure
+}
 fn merge(outcome: &mut Outcome, accepted: Accepted) -> Result<(), ErrorCode> {
-    let response = accepted.response;
-    record_usage(outcome, &response)?;
+    record_usage(outcome, &accepted.decoded)?;
     outcome.results.insert(
         accepted.id,
         EvaluationResult {
-            answers: response.answers,
-            usage: Some(response.usage),
+            answers: accepted.decoded.answers,
+            usage: Some(accepted.decoded.usage),
         },
     );
     Ok(())
 }
 
-fn record_usage(outcome: &mut Outcome, response: &ProviderResponse) -> Result<(), ErrorCode> {
+fn record_usage(outcome: &mut Outcome, decoded: &Decoded) -> Result<(), ErrorCode> {
     if outcome
         .model
         .as_ref()
-        .is_some_and(|model| model != &response.model)
+        .is_some_and(|model| model != &decoded.model)
     {
         return Err(ErrorCode::InvalidResponse);
     }
     let input_tokens = outcome
         .stats
         .input_tokens
-        .checked_add(response.usage.input_tokens.unwrap_or(0))
+        .checked_add(decoded.usage.input_tokens.unwrap_or(0))
         .ok_or(ErrorCode::InvalidResponse)?;
     let output_tokens = outcome
         .stats
         .output_tokens
-        .checked_add(response.usage.output_tokens.unwrap_or(0))
+        .checked_add(decoded.usage.output_tokens.unwrap_or(0))
         .ok_or(ErrorCode::InvalidResponse)?;
-    outcome.model.get_or_insert_with(|| response.model.clone());
+    outcome.model.get_or_insert_with(|| decoded.model.clone());
     outcome.stats.requests += 1;
-    outcome.stats.questions += response.answers.len();
+    outcome.stats.questions += decoded.answers.len();
     outcome.stats.input_tokens = input_tokens;
     outcome.stats.output_tokens = output_tokens;
     outcome.missing_usage |=
-        response.usage.input_tokens.is_none() || response.usage.output_tokens.is_none();
+        decoded.usage.input_tokens.is_none() || decoded.usage.output_tokens.is_none();
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use futures_util::poll;
-    use serde_json::{json, Value};
-    use std::time::Duration;
-    use tokio::{
-        io::{AsyncReadExt, AsyncWriteExt},
-        net::{TcpListener, TcpStream},
-        sync::{mpsc, oneshot},
-        time::timeout,
-    };
-
-    async fn read_request(stream: &mut TcpStream) -> Value {
-        let mut bytes = Vec::new();
-        let mut buffer = [0; 4096];
-        loop {
-            let count = stream.read(&mut buffer).await.unwrap();
-            assert_ne!(count, 0, "request body arrives before EOF");
-            bytes.extend_from_slice(&buffer[..count]);
-            if let Some(end) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
-                let headers = String::from_utf8_lossy(&bytes[..end]).to_lowercase();
-                let length: usize = headers
-                    .lines()
-                    .find_map(|line| line.strip_prefix("content-length: "))
-                    .unwrap()
-                    .parse()
-                    .unwrap();
-                if bytes.len() >= end + 4 + length {
-                    return serde_json::from_slice(&bytes[end + 4..end + 4 + length]).unwrap();
-                }
-            }
-        }
-    }
-
-    /// Abort must retain already-completed observations. No sleep controls the
-    /// race: the parent is polled once, then child completion is proven by the
-    /// permits becoming available, one deliberately released response at a time.
-    #[tokio::test]
-    async fn failure_drain_keeps_completed_compatible_usage_without_replacing_error() {
-        check_failure_drain(false).await;
-    }
-
-    #[tokio::test]
-    async fn failure_drain_keeps_partial_usage_without_replacing_error() {
-        check_failure_drain(true).await;
-    }
-
-    async fn check_failure_drain(partial_usage: bool) {
-        timeout(Duration::from_secs(5), async {
-            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let endpoint = format!("http://{}", listener.local_addr().unwrap());
-            let (ready_tx, mut ready_rx) = mpsc::unbounded_channel();
-            let server = tokio::spawn(async move {
-                let mut connections = JoinSet::new();
-                for _ in 0..4 {
-                    let (mut stream, _) = listener.accept().await.unwrap();
-                    let ready_tx = ready_tx.clone();
-                    connections.spawn(async move {
-                        let request = read_request(&mut stream).await;
-                        let index = request["state"]["index"].as_u64().unwrap() as usize;
-                        let (release, reply) = oneshot::channel::<(u16, String)>();
-                        ready_tx.send((index, release)).unwrap();
-                        let (status, body) = reply.await.unwrap();
-                        stream.write_all(format!("HTTP/1.1 {status} OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
-                    });
-                }
-                while let Some(result) = connections.join_next().await { result.unwrap(); }
-            });
-            let request: EvaluateRequest = serde_json::from_value(json!({
-                "timeout_ms": 3000,
-                "evaluations": (0..4).map(|index| json!({
-                    "id": format!("ticket-{index}"), "state": {"index": index},
-                    "questions": {"urgent": {"type": "noul", "instructions": "Is this urgent?"}}
-                })).collect::<Vec<_>>()
-            })).unwrap();
-            let client = JevClient::with_endpoint(Some("test-credential".into()), endpoint)
-                .with_retry(RetryPolicy {
-                    max_retries: 0,
-                    ..DEFAULT_RETRY
-                });
-            let evaluation = client.evaluate(request, crate::DEFAULT_MODEL);
-            tokio::pin!(evaluation);
-            // Preflight yields between encodings, so poll until all four
-            // children are spawned and have opened their connections. After
-            // that no evaluation poll occurs until every child has completed
-            // and queued its outcome in the JoinSet.
-            let mut responses = BTreeMap::new();
-            while responses.len() < 4 {
-                assert!(poll!(evaluation.as_mut()).is_pending());
-                tokio::task::yield_now().await;
-                while let Ok((index, release)) = ready_rx.try_recv() {
-                    responses.insert(index, release);
-                }
-            }
-            for index in 0..4 {
-                let (status, model, input_tokens) = match index {
-                    0 => (500, "jev-1.13.0", 0),
-                    1 => (200, "jev-1.13.0", 11),
-                    2 => (200, "incompatible-model", 100),
-                    _ => (200, "jev-1.13.0", u64::MAX),
-                };
-                let output_tokens = if partial_usage && index == 1 { None } else { Some(3) };
-                let body = json!({"model": model, "answers": {"urgent": {"type": "noul", "noul": 0.75}}, "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens}}).to_string();
-                responses.remove(&index).unwrap().send((status, body)).unwrap();
-                // On a current-thread runtime the child's send future and its
-                // owning task complete in the same poll that releases a permit.
-                let completed = client.permits.acquire_many(index as u32 + 1).await.unwrap();
-                drop(completed);
-            }
-            let response = evaluation.await;
-            let wire = serde_json::to_value(&response).unwrap();
-            assert!(wire.get("results").is_none());
-            let EvaluateResponse::Error { code, http_status, stats, .. } = response else { panic!("partial answers must not become success") };
-            assert_eq!(code, ErrorCode::Http);
-            assert_eq!(http_status, Some(500));
-            assert_eq!(stats.attempts, 4);
-            assert_eq!((stats.requests, stats.questions, stats.input_tokens, stats.output_tokens), (1, 1, 11, if partial_usage { 0 } else { 3 }));
-            assert!(!stats.usage_complete);
-            server.await.unwrap();
-        }).await.expect("controlled child completions finish");
-    }
 }

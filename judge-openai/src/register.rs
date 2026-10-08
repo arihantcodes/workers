@@ -1,5 +1,5 @@
 //! Typed bus registration and console configuration-form assets.
-use crate::{client::JevClient, configuration::SharedConfig};
+use crate::{client::DecisionsClient, configuration::SharedConfig};
 use iii_sdk::{errors::Error, IIIClient, RegisterFunction};
 use judge_contract::{
     CancelRequest, CancelResponse, ErrorCode, EvaluateRequest, EvaluateResponse, ModelsRequest,
@@ -15,8 +15,12 @@ use std::sync::Arc;
 /// so schema capture and worker readiness never require provider credentials.
 /// Returns the cache `secret://` keys resolve through; bind it to
 /// `secrets::changed` with [`judge_provider::secrets::register_secret_trigger`].
-pub fn register(iii: &IIIClient, config: SharedConfig, client: JevClient) -> Arc<SecretCache> {
-    let secrets = Arc::new(SecretCache::new(bus_fetch(iii.clone()), "judge-typesafe"));
+pub fn register(
+    iii: &IIIClient,
+    config: SharedConfig,
+    client: DecisionsClient,
+) -> Arc<SecretCache> {
+    let secrets = Arc::new(SecretCache::new(bus_fetch(iii.clone()), "judge-openai"));
     let models_config = config.clone();
     let models_client = client.clone();
     let models_secrets = secrets.clone();
@@ -66,8 +70,8 @@ pub fn register(iii: &IIIClient, config: SharedConfig, client: JevClient) -> Arc
     // The raw transport wrapper keeps a typed response and explicitly restores
     // the shared public request schema, as the provider registration helpers do.
     let request_schema = serde_json::to_value(schemars::schema_for!(EvaluateRequest))
-        .expect("JEV request schema serializes");
-    iii.register_function(crate::EVALUATE_ID, registration.request_format(request_schema).description("Evaluate Noul, Choice and Score questions against arbitrary JSON state using JEV. Results are atomic; stats retain known accepted usage and mark unknown counters incomplete. No credentials are accepted in the request.").metadata(provider_metadata()));
+        .expect("OpenAI request schema serializes");
+    iii.register_function(crate::EVALUATE_ID, registration.request_format(request_schema).description("Evaluate Noul, Choice and Score questions against arbitrary JSON state using the OpenAI Decisions API. Results are atomic; stats retain known accepted usage and mark unknown counters incomplete. No credentials are accepted in the request.").metadata(provider_metadata()));
 
     let registration = RegisterFunction::new_async(move |mut payload: Value| {
         let config = models_config.clone();
@@ -111,8 +115,8 @@ pub fn register(iii: &IIIClient, config: SharedConfig, client: JevClient) -> Arc
         }
     });
     let request_schema = serde_json::to_value(schemars::schema_for!(ModelsRequest))
-        .expect("JEV models request schema serializes");
-    iii.register_function(crate::MODELS_ID, registration.request_format(request_schema).description("List the provider's available model names, descriptions and release dates. Shares evaluation credentials, transport limits and permits; performs no inference.").metadata(provider_metadata()));
+        .expect("OpenAI models request schema serializes");
+    iii.register_function(crate::MODELS_ID, registration.request_format(request_schema).description("List the Decisions models this key can use (only supported ones), with descriptions and release dates; empty when none is visible. Shares evaluation credentials, transport limits and permits; performs no inference.").metadata(provider_metadata()));
 
     let registration = RegisterFunction::new_async(move |mut payload: Value| {
         let client = cancel_client.clone();
@@ -130,7 +134,7 @@ pub fn register(iii: &IIIClient, config: SharedConfig, client: JevClient) -> Arc
         }
     });
     let request_schema = serde_json::to_value(schemars::schema_for!(CancelRequest))
-        .expect("JEV cancel request schema serializes");
+        .expect("OpenAI cancel request schema serializes");
     iii.register_function(crate::CANCEL_ID, registration.request_format(request_schema).description("Signal cancellation of an active evaluation or model listing owned by the calling worker. Returns whether a signal was accepted; does not roll back provider work. Requires the same worker replica as the original call.").metadata(provider_metadata()));
     secrets
 }

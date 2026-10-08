@@ -854,24 +854,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "judge-provider"
+name = "judge-openai"
 version = "0.1.0"
-dependencies = [
- "httpdate",
- "iii-sdk",
- "judge-contract",
- "rand 0.9.5",
- "reqwest",
- "schemars",
- "serde",
- "serde_json",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "judge-typesafe"
-version = "0.2.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -891,6 +875,22 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "wiremock",
+]
+
+[[package]]
+name = "judge-provider"
+version = "0.1.0"
+dependencies = [
+ "httpdate",
+ "iii-sdk",
+ "judge-contract",
+ "rand 0.9.5",
+ "reqwest",
+ "schemars",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
