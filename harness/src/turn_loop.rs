@@ -25,7 +25,7 @@ use crate::types::event::ErrorKind;
 use crate::types::message::{empty_assistant, AgentMessage, AssistantMessage};
 use crate::types::model::AgentFunction;
 use crate::types::turn::{
-    CallCheckpoint, CallState, ExposeMode, FunctionPolicy, TurnRecord, TurnStatus,
+    CallCheckpoint, CallState, ExposeMode, FunctionPolicy, ResponseLanguage, TurnRecord, TurnStatus,
 };
 
 #[derive(Clone, Copy)]
@@ -191,6 +191,9 @@ pub async fn enqueue_step(
             }
         }
     }
+    // The record may already say `Running` at this step: follow up once its
+    // window passes, or nothing would ever run it (inflight.rs).
+    crate::inflight::suspect_unenqueued(session_id, turn_id, step);
     Err(HarnessError::Dependency(format!(
         "enqueue harness::turn: {last_error}"
     )))
@@ -566,12 +569,15 @@ async fn generate_step(
     // away is told again.
     // ponytail: judged before this step's own compaction; a notice it summarizes away is re-told next step
     let anchor = compaction_anchor(&record.session_id, &entries);
-    let window = crate::window::build(
+    let mut window = crate::window::build(
         &entries,
         anchor.window_start,
         prev_watermark.as_deref(),
         Some(&ids::assistant_entry_id(&record.turn_id, payload.step)),
     );
+    if crate::window::binds_thinking(&record.options.model) {
+        crate::window::strip_thinking_logged_before(&mut window, &entries[..anchor.record_index]);
+    }
 
     // Build every deterministic model-facing input before context assembly.
     // Everything the model is shown is append-only: the system prompt is the
@@ -581,12 +587,14 @@ async fn generate_step(
     // are persisted as `model_notice` entries where they were sent and
     // replayed there on every later step (crate::window).
     let current_generation = functions.generation;
-    // The runtime context (session id, working directory, dispatch policy,
-    // seeded contracts) is frozen into the system prompt at the session's
-    // first step; a later change reaches the model as a notice.
+    // The runtime context (session id, working directory, response language,
+    // dispatch policy, seeded contracts) is frozen into the system prompt at
+    // the session's first step; a later change reaches the model as a notice.
     let current_aid = runtime_context_aid(
         &record.session_id,
         record.options.filesystem_root(),
+        deps.filesystem_boundary("shell::exec").await,
+        record.options.response_language.as_ref(),
         record.options.functions.as_ref(),
         record.options.seeded_contracts.as_deref(),
     );
@@ -685,7 +693,11 @@ async fn generate_step(
             "native exposure matched no registry functions; the model has no tools this turn"
         );
     }
-    let mut tools = provider_tools(expose, &decision_tools);
+    let mut tools = provider_tools(
+        expose,
+        &decision_tools,
+        record.options.response_language.as_ref(),
+    );
     if let Some(submit) = strategy.submit_result_tool() {
         tools.push(submit);
     }
@@ -1727,12 +1739,13 @@ async fn finish_step(
             // args ALREADY carrying the filesystem scope stamp so an approver
             // reviews the fs_scope the call will actually run under; the stamp is
             // re-applied after the chain so a hook rewrite can never widen it.
+            let filesystem_boundary = deps.filesystem_boundary(&call.function_id).await;
             let trusted_call_args = crate::filesystem_scope::inject(
                 &call.function_id,
                 call_args.clone(),
                 filesystem_root.as_deref(),
                 &session_grants,
-                deps.hooks.filesystem_boundary(&call.function_id),
+                filesystem_boundary,
             );
             let (eff_args, pre_ann) = match deps
                 .hooks
@@ -1755,7 +1768,7 @@ async fn finish_step(
                         arguments,
                         filesystem_root.as_deref(),
                         &session_grants,
-                        deps.hooks.filesystem_boundary(&call.function_id),
+                        filesystem_boundary,
                     );
                     (arguments, annotations)
                 }
@@ -2294,9 +2307,20 @@ async fn complete_validated(
     value: Value,
 ) -> Result<TurnStepResult, HarnessError> {
     match deps.hooks.run_post_turn(record, record.step, &value).await {
-        Ok(()) => finalize_completed(deps, session, record, Some(value)).await,
+        // Both tails contain large async states. Inlining them propagates
+        // through the output-contract and dispatch futures, exhausting the
+        // SDK thread's debug stack when completion reads or resolves a parent.
+        Ok(()) => Box::pin(finalize_completed(deps, session, record, Some(value))).await,
         Err(deny) => {
-            retry_or_giveup_with(deps, session, record, &deny.reason, value, deny.prompt).await
+            Box::pin(retry_or_giveup_with(
+                deps,
+                session,
+                record,
+                &deny.reason,
+                value,
+                deny.prompt,
+            ))
+            .await
         }
     }
 }
@@ -3347,7 +3371,7 @@ async fn assemble_context(
         allow_prune: crate::window::binds_thinking(&record.options.model).then_some(false),
     };
 
-    let out = match context.assemble(params).await {
+    let mut out = match context.assemble(params).await {
         Ok(out) => out,
         Err(error) if is_context_overflow_error(&error) => {
             return Err(HarnessError::ContextOverflow(error));
@@ -3369,6 +3393,38 @@ async fn assemble_context(
         )));
     }
 
+    if strip_compacted_thinking(&mut out, &record.options.model) {
+        // The assembled count still holds the stripped blocks; an unchanged
+        // request reuses it for the budget reservation and the snapshot, so
+        // measure what is actually sent. On failure the larger count stands
+        // (it only over-reserves).
+        let recount = context
+            .count_tokens(crate::clients::context::CountTokensParams {
+                messages: out
+                    .messages
+                    .iter()
+                    .map(|m| serde_json::to_value(m).unwrap_or(Value::Null))
+                    .collect(),
+                model_id: record.options.model.clone(),
+                provider: record.options.provider.clone(),
+                system_prompt: Some(out.system_prompt.clone()),
+                tools: inputs.tools.to_vec(),
+            })
+            .await;
+        match recount {
+            Ok(count) => {
+                out.token_count = count.tokens.saturating_add(inputs.request_overhead_tokens);
+                if let (Some(breakdown), Some(by_role)) = (out.breakdown.as_mut(), count.by_role) {
+                    breakdown.by_role = by_role;
+                }
+            }
+            Err(error) => tracing::warn!(
+                session_id = %record.session_id,
+                %error,
+                "recount after stripping pre-compaction thinking failed; keeping the assembled count"
+            ),
+        }
+    }
     if out.applied.compacted {
         if let Some(summary) = &out.applied.summary {
             let tail_entry = out
@@ -3426,6 +3482,23 @@ async fn assemble_context(
     })
 }
 
+/// Everything a compacting step kept was produced before its own compaction:
+/// on a binding model strip its thinking, the same strip every later step
+/// applies (crate::window::strip_thinking_logged_before). True when it
+/// stripped, so the caller re-counts.
+fn strip_compacted_thinking(
+    out: &mut crate::clients::context::AssembleOutput,
+    model: &str,
+) -> bool {
+    if !(out.applied.compacted && crate::window::binds_thinking(model)) {
+        return false;
+    }
+    out.messages
+        .iter_mut()
+        .for_each(AgentMessage::strip_thinking);
+    true
+}
+
 /// The latest `compaction` custom entry on the path, resolved to where the
 /// model-facing window opens.
 #[derive(Debug, Default, PartialEq)]
@@ -3436,6 +3509,9 @@ struct CompactionAnchor {
     window_start: usize,
     /// Size of the history the summary replaced (display only).
     summarized_head_tokens: Option<u64>,
+    /// Path index of the record whose summary is in the prompt (0 when none):
+    /// the entries before it were logged under a prefix that is gone.
+    record_index: usize,
 }
 
 /// Resolve the window from the latest compaction entry:
@@ -3490,6 +3566,7 @@ fn compaction_anchor(session_id: &str, entries: &[LoadedEntry]) -> CompactionAnc
         }
     };
     CompactionAnchor {
+        record_index: if summary.is_some() { index } else { 0 },
         summary,
         window_start,
         // The console's entry carries only `tokens_before` (the head size).
@@ -3607,17 +3684,32 @@ fn with_runtime_context(
 
 /// The deterministic session context appended to every model-facing prompt.
 /// Kept separate so read-only previews use the same construction as a turn.
-/// A spawned child's seeded `<preloaded_functions>` block closes it: after the
-/// cache seam, so it never forks the stable prefix sessions share.
+/// The response-language line names the session's pinned language, once one
+/// is (`crate::language`), right after the working directory, whose path must
+/// never be read as a hint of it. Under `configured_roots` the working
+/// directory only anchors relative paths, and its line says so. A spawned
+/// child's seeded `<preloaded_functions>` block closes it: after the cache
+/// seam, so it never forks the stable prefix sessions share.
 pub(crate) fn runtime_context_aid(
     session_id: &str,
     filesystem_root: Option<&str>,
+    boundary: crate::filesystem_scope::FilesystemBoundary,
+    response_language: Option<&ResponseLanguage>,
     functions: Option<&FunctionPolicy>,
     seeded_contracts: Option<&str>,
 ) -> String {
     let mut lines = vec![format!("Your session id is {session_id}.")];
     if let Some(dir) = filesystem_root {
-        lines.push(format!("Your working directory is {dir}."));
+        let note = match boundary {
+            crate::filesystem_scope::FilesystemBoundary::Workspace => "",
+            crate::filesystem_scope::FilesystemBoundary::ConfiguredRoots => {
+                " (default directory, not an access boundary)"
+            }
+        };
+        lines.push(format!("Your working directory is {dir}{note}."));
+    }
+    if let Some(language) = response_language {
+        lines.push(crate::language::runtime_line(language));
     }
     if let Some(aid) = policy_aid(functions) {
         lines.push(aid);
@@ -4041,13 +4133,15 @@ fn concrete_allowed_tools(
 
 /// The invocation-schema surface attached to the generate request
 /// (harness.md § Exposure modes). Default: the single `agent_trigger`
-/// schema. Native: the concrete allowed tools verbatim.
+/// schema, its `description` label naming the session's response language.
+/// Native: the concrete allowed tools verbatim.
 fn provider_tools(
     expose: ExposeMode,
     concrete: &[crate::types::model::AgentFunction],
+    response_language: Option<&ResponseLanguage>,
 ) -> Vec<crate::types::model::AgentFunction> {
     match expose {
-        ExposeMode::AgentTrigger => vec![policy::agent_trigger_schema()],
+        ExposeMode::AgentTrigger => vec![policy::agent_trigger_schema(response_language)],
         ExposeMode::Native => concrete.to_vec(),
     }
 }
@@ -4092,6 +4186,9 @@ impl Clone for SessionStreamSink {
         }
     }
 }
+
+#[cfg(test)]
+mod stack_tests;
 
 #[cfg(test)]
 mod tests {
@@ -4266,7 +4363,14 @@ mod tests {
                 summary: Some("new".into()),
                 window_start: 2,
                 summarized_head_tokens: Some(7),
+                record_index: 3,
             }
+        );
+        // The summary is in the prompt even when the boundary is off the
+        // path, so thinking logged before the record is still stale.
+        assert_eq!(
+            compaction_anchor("s", &[msg("u1"), compaction("c1", "s", json!("gone"))]).record_index,
+            1
         );
         // Null boundary: everything before the entry was summarised.
         assert_eq!(
@@ -4310,6 +4414,51 @@ mod tests {
             ),
             CompactionAnchor::default()
         );
+    }
+
+    #[test]
+    fn a_compacting_step_strips_kept_thinking_only_on_binding_models() {
+        use serde_json::json;
+        let assembled = |compacted: bool| -> crate::clients::context::AssembleOutput {
+            serde_json::from_value(json!({
+                "messages": [
+                    { "role": "user", "content": [{ "type": "text", "text": "go" }], "timestamp": 1 },
+                    { "role": "assistant", "content": [
+                        { "type": "thinking", "text": "", "signature": "sig" },
+                        { "type": "redacted_thinking", "data": "x" },
+                        { "type": "function_call", "id": "c1", "function_id": "shell::exec", "arguments": {} }
+                    ], "stop_reason": "function_call", "model": "m", "provider": "p", "timestamp": 2 }
+                ],
+                "token_count": 10, "usable": 100, "effective_max_output_tokens": 10,
+                "applied": { "compacted": compacted, "summary": "s" }
+            }))
+            .unwrap()
+        };
+        let thinking = |out: &crate::clients::context::AssembleOutput| {
+            out.messages.iter().any(|m| match m {
+                AgentMessage::Assistant(a) => a.content.iter().any(|b| {
+                    matches!(
+                        b,
+                        ContentBlock::Thinking { .. } | ContentBlock::RedactedThinking { .. }
+                    )
+                }),
+                _ => false,
+            })
+        };
+        let mut out = assembled(true);
+        assert!(super::strip_compacted_thinking(
+            &mut out,
+            "claude-sonnet-5-5"
+        ));
+        assert!(!thinking(&out), "stale thinking would reach the request");
+        for (compacted, model) in [(false, "claude-opus-5-5"), (true, "claude-sonnet-4-6")] {
+            let mut out = assembled(compacted);
+            assert!(!super::strip_compacted_thinking(&mut out, model));
+            assert!(
+                thinking(&out),
+                "{model} compacted={compacted} keeps its thinking"
+            );
+        }
     }
 
     #[test]
@@ -4667,6 +4816,61 @@ mod tests {
         );
     }
 
+    /// Prevents: a model guessing the response language from the username
+    /// in the working directory (an English session labelled in Spanish).
+    /// The aid names it right after the directory; pinning it later changes
+    /// the aid, so it reaches the model as a runtime-context notice.
+    #[test]
+    fn runtime_context_names_the_response_language_after_the_working_directory() {
+        let english = super::ResponseLanguage {
+            code: "eng".into(),
+            name: "English".into(),
+        };
+        let named = super::runtime_context_aid(
+            "s_1",
+            Some("/home/sergio/app"),
+            crate::filesystem_scope::FilesystemBoundary::Workspace,
+            Some(&english),
+            None,
+            None,
+        );
+        let lines: Vec<&str> = named.lines().collect();
+        assert_eq!(lines[1], "Your working directory is /home/sergio/app.");
+        assert!(lines[2].starts_with("Response language: English (from the user's first message)."));
+        let unknown = super::runtime_context_aid(
+            "s_1",
+            Some("/home/sergio/app"),
+            crate::filesystem_scope::FilesystemBoundary::Workspace,
+            None,
+            None,
+            None,
+        );
+        assert!(
+            !unknown.contains("Response language"),
+            "an unpinned session's runtime context is unchanged"
+        );
+        let notice = super::runtime_change_notice(&unknown, &named, None).expect("pinned later");
+        assert!(notice.contains("Response language: English"));
+    }
+
+    #[test]
+    fn the_agent_trigger_tool_names_the_response_language() {
+        let english = super::ResponseLanguage {
+            code: "eng".into(),
+            name: "English".into(),
+        };
+        let label = |language: Option<&super::ResponseLanguage>| {
+            super::provider_tools(super::ExposeMode::AgentTrigger, &[], language)[0].parameters
+                ["properties"]["description"]["description"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        assert!(label(Some(&english)).contains("written in English."));
+        assert!(label(None).contains("named in the session context"));
+        assert!(super::provider_tools(super::ExposeMode::Native, &[], Some(&english)).is_empty());
+    }
+
     /// Prevents: a child's seeded contracts forking the stable prefix every
     /// default-identity session shares (MOT-4851) — they ride after the seam.
     #[test]
@@ -4681,7 +4885,16 @@ mod tests {
             .unwrap()
         };
         let block = "<preloaded_functions>\n### `state::get`\n</preloaded_functions>";
-        let aid = |seeded: Option<&str>| super::runtime_context_aid("s_1", None, None, seeded);
+        let aid = |seeded: Option<&str>| {
+            super::runtime_context_aid(
+                "s_1",
+                None,
+                crate::filesystem_scope::FilesystemBoundary::Workspace,
+                None,
+                None,
+                seeded,
+            )
+        };
         let (plain_stable, plain_full) =
             super::with_runtime_context(Some("identity".into()), &record(None), &aid(None));
         let (stable, full) = super::with_runtime_context(
@@ -4699,12 +4912,35 @@ mod tests {
         assert!(rest.ends_with(&format!("\n\n{block}")));
     }
 
+    /// Prevents: the model reading its working directory as an access
+    /// boundary when the worker only uses it to anchor relative paths
+    /// (MOT-5167).
+    #[test]
+    fn working_directory_line_says_when_it_is_not_a_boundary() {
+        use crate::filesystem_scope::FilesystemBoundary::*;
+        let aid =
+            |boundary| super::runtime_context_aid("s_1", Some("/w"), boundary, None, None, None);
+        assert!(aid(Workspace).contains("Your working directory is /w.\n"));
+        assert!(aid(ConfiguredRoots).contains(
+            "Your working directory is /w (default directory, not an access boundary).\n"
+        ));
+    }
+
     /// Prevents: a runtime context that changed after it was frozen into the
     /// system prompt (a re-seeded contract block included) never reaching the
     /// model, or reaching it again on every step (MOT-4845).
     #[test]
     fn runtime_change_notice_carries_the_whole_changed_aid_once() {
-        let aid = |seeded: Option<&str>| super::runtime_context_aid("s_1", None, None, seeded);
+        let aid = |seeded: Option<&str>| {
+            super::runtime_context_aid(
+                "s_1",
+                None,
+                crate::filesystem_scope::FilesystemBoundary::Workspace,
+                None,
+                None,
+                seeded,
+            )
+        };
         let frozen = aid(None);
         assert_eq!(super::runtime_change_notice(&frozen, &frozen, None), None);
 

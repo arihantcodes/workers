@@ -771,6 +771,9 @@ async fn handle(
     // per-owner capacity check are one CAS-backed operation; a deadline that
     // lapsed since resolution surfaces as `ReserveOutcome::Exhausted`.
     require_reserved(store.reserve(&binding).await?)?;
+    // The deadline is a timer from the moment the record is durable; every
+    // later delete of the record (rollback below included) cancels it.
+    crate::bindings::expiry::arm(deps, &binding);
 
     let trigger_id =
         match register_delivery_trigger(deps, &req.trigger_type, &req.config, &binding.id) {
@@ -802,7 +805,8 @@ async fn handle(
     }
 
     // A preflight snapshot cannot close the provider's asynchronous activation
-    // window. Recover a missed terminal event now and through the durable sweep.
+    // window. Recover a missed terminal event now; the harness's own terminal
+    // Compose watch and every engine worker change retry it from the record.
     crate::bindings::compose::schedule(deps, &binding);
 
     let notes: Vec<String> = [
@@ -917,10 +921,14 @@ async fn reject_settled_compose_operation(
     if !is_settled_operation(status) {
         return Ok(());
     }
+    // Ids are daemon-global, so a settled op may be another session's that
+    // reused the same fixed name (MOT-5334): say both readings.
     Err(HarnessError::InvalidRequest(format!(
-        "operation `{operation_id}` already reached `{status}`. Read the result with \
-         `compose::operation` now instead of arming a wake, and register the wake BEFORE \
-         starting the operation next time, in the same message."
+        "operation `{operation_id}` already reached `{status}`. If you started it, read the \
+         result with `compose::operation` now instead of arming a wake, and register the wake \
+         BEFORE starting the operation next time, in the same message. If you have NOT started \
+         it yet, the id belongs to an earlier operation: pick a fresh id that starts with your \
+         session id and register again."
     )))
 }
 
@@ -1528,6 +1536,14 @@ fn delivery_registration_input_for_namespace(
         Some(namespace) => input.in_trigger_namespace(namespace),
         None => input,
     }
+}
+
+/// The provider namespace a `compose-operation` registration must name
+/// (`III_COMPOSE_NAMESPACE`), if the supervisor set one.
+pub(crate) fn compose_operation_trigger_namespace() -> Option<String> {
+    let compose_namespace = std::env::var(COMPOSE_NAMESPACE_ENV).ok();
+    compose_provider_namespace(COMPOSE_OPERATION_TRIGGER, compose_namespace.as_deref())
+        .map(str::to_string)
 }
 
 fn compose_provider_namespace<'a>(

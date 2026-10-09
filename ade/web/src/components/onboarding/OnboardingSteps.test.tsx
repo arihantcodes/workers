@@ -1,7 +1,7 @@
 import { renderToStaticMarkup } from 'react-dom/server'
 import { describe, expect, it, vi } from 'vitest'
 import type { ToolScan } from '@/lib/onboarding/plan'
-import { type ExamplePrompt, HARNESS_PROMPTS } from '@/lib/onboarding/prompts'
+import type { ExamplePrompt } from '@/lib/onboarding/prompts'
 import { ModelsStep } from './ModelsStep'
 import { ReadyStep, type TourState } from './ReadyStep'
 import {
@@ -54,6 +54,8 @@ function controller(
       installed,
       consoleConfig: null,
       judgeProvider: null,
+      browser: null,
+      browserError: null,
       ...snapshot,
     },
     scanning: false,
@@ -62,10 +64,27 @@ function controller(
     running: null,
     run: async () => true,
     judgeInstalled: installed.has('judge'),
+    checkChromium: async () => null,
+    installChromium: async () => ({ ok: true as const }),
+    chromiumProgress: null,
   }
 }
 
 const noop = () => undefined
+
+/** The harness template's four, as `console::onboarding::prompts` serves them. */
+const PROMPTS: ExamplePrompt[] = [
+  'Build a link shortener',
+  'Build an expense tracker',
+  'Create a test reviewer agent',
+  'Explain this project',
+].map((title, index) => ({
+  title,
+  description: `${title}, described`,
+  agent: index === 3 ? 'default' : 'ade-worker-builder',
+  prompt: `${title}.`,
+  models: [{ provider: 'claude-code', model: 'claude-sonnet-5-5' }],
+}))
 
 describe('ModelsStep', () => {
   it('shows real marks for every built-in provider before workers are installed', () => {
@@ -76,7 +95,8 @@ describe('ModelsStep', () => {
         onNext={noop}
       />,
     )
-    expect(html.match(/data-provider-icon="mark"/g)).toHaveLength(9)
+    // Nine catalog providers plus GitHub Copilot, which signs in from here.
+    expect(html.match(/data-provider-icon="mark"/g)).toHaveLength(10)
     expect(html).not.toContain('data-provider-icon="initial"')
   })
 
@@ -217,7 +237,10 @@ describe('ModelsStep', () => {
     expect(html).toContain('Key found')
     expect(html).toContain('Use the key from this project&#x27;s .env')
     expect(html).toContain('sk-ant…9f2c')
-    expect(html).toContain('Point llm-router at secret://ANTHROPIC_API_KEY')
+    expect(html).toContain(
+      'Stored encrypted on this machine. It never lands in a file you commit.',
+    )
+    expect(html).not.toContain('secret://')
     // llm-router reads env:// too, so the key may stay a variable instead.
     expect(html).toContain('role="radiogroup"')
     expect(html).toContain('Encrypted')
@@ -231,6 +254,7 @@ const CONNECTED: MachineSnapshot['providers'] = [
     title: 'Claude Code',
     configured: false,
     available: true,
+    ownsAuthentication: true,
     modelCount: 11,
   },
   {
@@ -277,8 +301,9 @@ describe('ReadyStep', () => {
     ])
     expect(html).toContain('Your harness is ready')
     expect(html).toContain('Claude Code connected')
-    expect(html).toContain('key at secret://ANTHROPIC_API_KEY')
+    expect(html).toContain('11 models')
     // Where the keys live is not a summary line: it reads as jargon here.
+    expect(html).not.toContain('secret://')
     expect(html).not.toContain('Your keys stay out of git')
     expect(html).not.toContain('configuration holds only')
     expect(html).toContain('Workers added')
@@ -300,8 +325,9 @@ describe('ReadyStep', () => {
         },
       ],
     })
-    expect(html).toContain('key at env://OPENAI_API_KEY')
-    expect(html).not.toContain('Your keys stay out of configuration')
+    expect(html).toContain('OpenAI connected')
+    expect(html).toContain('4 models')
+    expect(html).not.toContain('env://')
   })
 
   it('offers the guided tour in place of starter prompts, without naming its worker', () => {
@@ -326,12 +352,7 @@ describe('ReadyStep', () => {
   })
 
   it('offers the four example prompts as chats to start, each with its agent', () => {
-    const html = ready(
-      { providers: CONNECTED },
-      { kind: 'idle' },
-      [],
-      HARNESS_PROMPTS,
-    )
+    const html = ready({ providers: CONNECTED }, { kind: 'idle' }, [], PROMPTS)
     expect(html).toContain('Try an example')
     expect(html).toContain('aria-label="Start a chat: Build a link shortener"')
     expect(html).toContain('Build an expense tracker')
@@ -352,7 +373,7 @@ describe('ReadyStep', () => {
     ).not.toContain('Try an example')
     // No model, no prompt to answer it.
     expect(
-      ready({ providers: [] }, { kind: 'idle' }, [], HARNESS_PROMPTS),
+      ready({ providers: [] }, { kind: 'idle' }, [], PROMPTS),
     ).not.toContain('Try an example')
   })
 

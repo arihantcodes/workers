@@ -1,10 +1,9 @@
 /**
- * The example prompts the setup wizard's last step offers. A project's
- * template declares them in `onboarding.yaml` at the project root, which the
- * ADE serves through `console::onboarding::prompts` (reading and validating
- * the file on every call). An ADE that predates that function gets the
- * harness template's four, built in below, so the step still has something
- * to offer.
+ * The example prompts the setup wizard's last step offers. The project's
+ * template declares them in `onboarding.yaml` at the project root (the
+ * harness template ships four); `console::onboarding::prompts` reads and
+ * validates that file on every call, and answers `[]` when it is missing or
+ * broken, so a project without one simply shows none.
  *
  * Each prompt names the agent profile it runs with and a priority list of
  * models: the first one this machine's catalog holds wins.
@@ -38,65 +37,6 @@ export interface ExamplePrompt {
 }
 
 const PROMPTS_FUNCTION = 'console::onboarding::prompts'
-
-/** The usual priority list: the same model on every provider that serves it. */
-const sonnetEverywhere = (effort: string): PromptModel[] => [
-  { provider: 'claude-code', model: 'claude-sonnet-5-5', effort },
-  { provider: 'anthropic', model: 'claude-sonnet-5-5', effort },
-  { provider: 'openai-codex', model: 'gpt-6.1-sol', effort },
-  { provider: 'openai', model: 'gpt-6.1-sol', effort },
-  { provider: 'github-copilot', model: 'gpt-6.1-sol', effort },
-  { provider: 'openrouter', model: 'anthropic/claude-sonnet-5.5', effort },
-  { provider: 'deepseek', model: 'deepseek-flash' },
-]
-
-/**
- * The harness template's `onboarding.yaml`, as shipped: what the step shows
- * when the ADE backend has no `console::onboarding::prompts` to ask.
- */
-export const HARNESS_PROMPTS: readonly ExamplePrompt[] = [
-  {
-    title: 'Build a link shortener',
-    description:
-      'Short links with their own public page, 302 redirects, and an admin panel',
-    agent: 'ade-worker-builder',
-    prompt: [
-      'Build a link shortener named `link-shortener`.',
-      '',
-      '- Each link has a name, a target URL (http or https only) and a short code the app generates.',
-      '- The public page creates a link, shows and copies its short URL, and lists the saved links.',
-      '- `/<worker>/go/<code>` redirects (302) to the target, or answers 404 for an unknown code.',
-      '',
-      'Test it in the browser: create one link through the form, copy it and open it. No demo records. Leave the public page open at the end.',
-    ].join('\n'),
-    models: sonnetEverywhere('medium'),
-  },
-  {
-    title: 'Build an expense tracker',
-    description:
-      'Expenses by category, and a public page with the total still to be reimbursed',
-    agent: 'ade-worker-builder',
-    prompt:
-      'Build an expense tracker. Each expense has a description, an amount, a category, and whether it was reimbursed. Show the total still to be reimbursed.',
-    models: sonnetEverywhere('medium'),
-  },
-  {
-    title: 'Create a test reviewer agent',
-    description:
-      'A reusable agent that reviews your workers and suggests tests',
-    agent: 'agent-profile-creator',
-    prompt:
-      'Create an agent that reviews my workers and suggests useful tests.',
-    models: sonnetEverywhere('medium'),
-  },
-  {
-    title: 'Explain this project',
-    description: 'What runs here, and what you could work on next',
-    agent: 'default',
-    prompt: 'Explain this project and help me decide what to work on next.',
-    models: sonnetEverywhere('low'),
-  },
-]
 
 function text(value: unknown): string | undefined {
   return typeof value === 'string' && value.trim() ? value.trim() : undefined
@@ -148,9 +88,8 @@ export function parseExamplePrompts(value: unknown): ExamplePrompt[] {
 }
 
 /**
- * The project's example prompts: the ADE's answer when it has one (`[]`
- * for a project that declares none), the harness template's four when the
- * backend predates the function.
+ * The project's example prompts; `[]` when the ADE backend predates them or
+ * the project declares none.
  */
 export async function fetchExamplePrompts(): Promise<ExamplePrompt[]> {
   const client = await getIiiClient()
@@ -162,7 +101,7 @@ export async function fetchExamplePrompts(): Promise<ExamplePrompt[]> {
     )
     return parseExamplePrompts(result)
   } catch (error) {
-    if (isMissingFunction(error)) return [...HARNESS_PROMPTS]
+    if (isMissingFunction(error)) return []
     throw error
   }
 }

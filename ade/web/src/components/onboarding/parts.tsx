@@ -11,36 +11,66 @@ import type * as React from 'react'
 import { useEffect, useId, useRef, useState } from 'react'
 import { KeyChoice } from '@/components/secrets/KeyChoice'
 import { copyTextToClipboard } from '@/lib/clipboard'
-import { describeStep, type PlanStep } from '@/lib/onboarding/plan'
+import { describeStep, type PlanStep, stepDetail } from '@/lib/onboarding/plan'
 import {
+  DEFAULT_ENV_FILE,
   defaultKeyInput,
   type KeyDetection,
   type KeyInput,
   type KeyStore,
   keyInputReady,
+  keyStore,
 } from '@/lib/secrets'
 import { cn } from '@/lib/utils'
 import type { ActivityEntry } from './use-onboarding'
 
+/** Where a step sits among the setup steps (Welcome and Ready not counted). */
+export interface StepPosition {
+  /** 1-based. */
+  index: number
+  total: number
+}
+
+/**
+ * `Step 2 of 3 · Optional`, from the wizard's actual list of steps. The rail
+ * already shows the position, so the header keeps only the "Optional" part
+ * (as its badge); the function stays for steps written against it.
+ */
+export function stepEyebrow(
+  position: StepPosition | undefined,
+  optional = false,
+): string | undefined {
+  const parts = [
+    position ? `Step ${position.index} of ${position.total}` : null,
+    optional ? 'Optional' : null,
+  ].filter((part): part is string => part !== null)
+  return parts.length > 0 ? parts.join(' · ') : undefined
+}
+
 /** The step's title, one line under it, and a small action at its right. */
 export function StepHeader({
+  eyebrow,
   title,
   badge,
   lead,
   action,
 }: {
+  /** A `stepEyebrow`; only its "Optional" survives, as the badge. */
+  eyebrow?: string
   title: string
   /** A short tag beside the title: "Optional". */
   badge?: React.ReactNode
   lead?: React.ReactNode
   action?: React.ReactNode
 }) {
+  const tag = badge ?? (eyebrow?.includes('Optional') ? 'Optional' : null)
   return (
     <header className="flex flex-col gap-1">
       <div className="flex min-h-8 items-center justify-between gap-3">
         <h2 className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-balance font-sans text-base font-semibold leading-6 tracking-[-0.01em] text-ink">
+          {eyebrow ? <span className="sr-only">{eyebrow}. </span> : null}
           {title}
-          {badge ? <StatusChip tone="neutral">{badge}</StatusChip> : null}
+          {tag ? <StatusChip tone="neutral">{tag}</StatusChip> : null}
         </h2>
         {action}
       </div>
@@ -308,7 +338,8 @@ export function EngineLog({
           </li>
         ))}
         {queued.map((step, index) => {
-          const { title, detail } = describeStep(step)
+          const title = describeStep(step)
+          const detail = stepDetail(step)
           return (
             // biome-ignore lint/suspicious/noArrayIndexKey: a plan is rebuilt whole; its order is its identity
             <li key={`queued-${index}`} className="flex gap-2.5">
@@ -338,7 +369,7 @@ function LogLine({
   children,
 }: {
   title: string
-  command: string
+  command?: string
   tone: 'ink' | 'queued' | 'failed'
   trailing?: string
   children?: React.ReactNode
@@ -362,12 +393,14 @@ function LogLine({
           </span>
         ) : null}
       </span>
-      <span className="break-all text-neutral-600 dark:text-neutral-400">
-        <span aria-hidden className="select-none text-neutral-500">
-          ${' '}
+      {command ? (
+        <span className="break-all text-neutral-600 dark:text-neutral-400">
+          <span aria-hidden className="select-none text-neutral-500">
+            ${' '}
+          </span>
+          {command}
         </span>
-        {command}
-      </span>
+      ) : null}
       {children}
     </span>
   )
@@ -429,6 +462,25 @@ function LogGlyph({
         className,
         terminal ? 'text-emerald-700 dark:text-emerald-400' : 'text-ink',
       )}
+    />
+  )
+}
+
+/**
+ * What a step did, for steps written against upstream's `ActivityLog`: the
+ * engine log with nothing queued.
+ */
+export function ActivityLog({
+  entries,
+}: {
+  entries: readonly ActivityEntry[]
+  title?: string
+}) {
+  return (
+    <EngineLog
+      plan={[]}
+      entries={entries}
+      running={entries.some((entry) => entry.status === 'running')}
     />
   )
 }
@@ -573,6 +625,11 @@ export function KeyField({
         stores={stores}
         envFile={envFile}
       />
+      <p className="font-sans text-xs leading-4 text-neutral-500 dark:text-neutral-400">
+        {keyStore(value ?? defaultKeyInput(detection)) === 'env'
+          ? `Kept in this project's ${envFile ?? DEFAULT_ENV_FILE} file.`
+          : 'Stored encrypted on this machine. It never lands in a file you commit.'}
+      </p>
     </div>
   )
 }

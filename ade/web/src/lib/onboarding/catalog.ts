@@ -1,9 +1,8 @@
 /**
  * What the setup wizard knows before it asks the engine anything: the
  * subscription providers a local CLI sign-in unlocks, the API-key env var
- * each key provider declares, the judge strategies, the five things the
- * harness should show a new user as early as possible, and the worker that
- * carries the guided tour once setup is done.
+ * each key provider declares, the judge strategies, and the five things the
+ * harness should show a new user as early as possible.
  *
  * Worker names are registry slugs — what `compose::add` resolves. A
  * development checkout can point any of them at a local directory through
@@ -48,6 +47,32 @@ export const SUBSCRIPTION_PROVIDERS: readonly SubscriptionProvider[] = [
     plan: 'your ChatGPT plan',
     install: 'npm install -g @openai/codex',
     signIn: 'codex login',
+  },
+]
+
+/**
+ * A provider that signs in with a device flow from the ADE: the worker hands
+ * out a code, the person enters it on `provider`'s page, the ADE polls.
+ */
+export interface DeviceProvider {
+  providerId: string
+  worker: string
+  title: string
+  plan: string
+  /** Returns `{ user_code, verification_uri, device_code }`. */
+  loginStart: string
+  /** Takes `{ device_code }`, returns `{ status }`. */
+  loginPoll: string
+}
+
+export const DEVICE_PROVIDERS: readonly DeviceProvider[] = [
+  {
+    providerId: 'github-copilot',
+    worker: 'provider-github-copilot',
+    title: 'GitHub Copilot',
+    plan: 'your GitHub Copilot plan',
+    loginStart: 'provider::github-copilot::login::start',
+    loginPoll: 'provider::github-copilot::login::poll',
   },
 ]
 
@@ -129,6 +154,8 @@ export interface JudgeOption {
   runs: string
   /** A hosted judge needs a key; local judges download a model instead. */
   envVar?: string
+  /** Who issues that key, as the user knows them (`TypeSafe`). */
+  keyOwner?: string
   keysUrl?: string
   recommended?: boolean
 }
@@ -142,22 +169,42 @@ export const JUDGE_OPTIONS: readonly JudgeOption[] = [
       'A model trained only to make typed decisions. Fast and the most accurate option.',
     runs: 'Hosted · needs a TypeSafe API key',
     envVar: 'TYPESAFE_API_KEY',
+    keyOwner: 'TypeSafe',
     keysUrl: 'https://typesafe.ai',
     recommended: true,
+  },
+  {
+    id: 'openai',
+    worker: 'judge-openai',
+    title: 'Decisions by OpenAI',
+    summary:
+      "OpenAI's hosted Decisions API: a choice or a score with its probabilities, in one call.",
+    runs: 'Hosted · needs an OpenAI API key',
+    envVar: 'OPENAI_API_KEY',
+    keyOwner: 'OpenAI',
+    keysUrl: 'https://platform.openai.com/api-keys',
+  },
+  {
+    id: 'clef',
+    worker: 'judge-clef',
+    title: 'Clef by Cloudflare',
+    summary:
+      "Cloudflare's decision model. Decides every question of a call in one pass, on this machine.",
+    runs: 'Runs on this machine · a GPU is recommended · downloads its 6.5 GB model once',
   },
   {
     id: 'laya',
     worker: 'judge-laya',
     title: 'Laya',
-    summary: 'Small ModernBERT decision checkpoints that run on this machine.',
-    runs: 'Local · CPU is enough · downloads its checkpoints once',
+    summary: 'Small decision models that run on this machine.',
+    runs: 'Runs on this machine · CPU is enough · downloads its models once',
   },
   {
     id: 'decider',
     worker: 'judge-decider',
     title: 'Decider',
-    summary: 'A 4B decision model served by llama.cpp on this machine.',
-    runs: 'Local · a GPU is recommended · downloads a GGUF model once',
+    summary: 'A larger decision model that runs on this machine.',
+    runs: 'Runs on this machine · a GPU is recommended · downloads its model once',
   },
 ]
 

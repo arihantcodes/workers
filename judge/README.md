@@ -71,7 +71,8 @@ See the [mixed Noul/Choice/Score example](reference.md#evaluate),
 
 **Settings → Workers → judge** selects the default provider from the workers
 registered as `judge-<provider>` (seeded from `JUDGE_PROVIDER`, else `typesafe`).
-Five ship today: [`judge-typesafe`](../judge-typesafe/) (TypeSafe's hosted JEV),
+Six ship today: [`judge-typesafe`](../judge-typesafe/) (TypeSafe's hosted JEV),
+[`judge-openai`](../judge-openai/) (OpenAI's hosted Decisions API),
 [`judge-decider`](../judge-decider/), [`judge-semif`](../judge-semif/),
 [`judge-laya`](../judge-laya/) and [`judge-clef`](../judge-clef/) (open models running inside the worker); a request may name its own with a top-level
 `provider`. Between the two sits
@@ -95,6 +96,15 @@ marked `metadata.internal: true` so default discovery shows only the hub, and
 accepts request ids up to 512 bytes; the hub needs no change. See
 [Configuration](reference.md#configuration) and
 [Cancellation](reference.md#cancellation).
+
+## Chat mentions
+
+Because the harness always runs the judge, the judge also delivers chat
+mentions to agents: a user's `@kanban(id="…")` (or any worker-defined
+mention) reaches the agent with a one-line summary of the item and a
+pre-verified call for its full details, and agents learn which mention names
+they may write in replies. See [Chat mentions](reference.md#chat-mentions);
+`JUDGE_MENTIONS=false` turns it off.
 
 The hub holds no credentials; its configuration entry (`judge`, or
 `III_CONFIG_NAME`) carries only the default provider and `preload_all`. For the full API,

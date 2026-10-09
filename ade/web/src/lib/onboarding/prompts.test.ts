@@ -1,7 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   fetchExamplePrompts,
-  HARNESS_PROMPTS,
   type PromptModel,
   parseExamplePrompts,
   resolvePromptModel,
@@ -52,11 +51,18 @@ describe('resolvePromptModel', () => {
     ).toBeNull()
   })
 
+  it('leaves the effort out when the entry has none', () => {
+    expect(resolvePromptModel(PRIORITY, ['openai::gpt-6.1-sol'])).toEqual({
+      model: 'openai::gpt-6.1-sol',
+    })
+  })
+
   it('is null when nothing in the list is available, so the chat keeps its default', () => {
     expect(resolvePromptModel(PRIORITY, ['deepseek::deepseek-flash'])).toBe(
       null,
     )
     expect(resolvePromptModel([], ['openai::gpt-6.1-sol'])).toBeNull()
+    expect(resolvePromptModel(PRIORITY, ['not-a-key'])).toBeNull()
   })
 })
 
@@ -72,11 +78,13 @@ describe('parseExamplePrompts', () => {
             prompt: 'Build a TODO app.',
             models: [
               { provider: 'claude-code', model: 'claude-sonnet-5-5' },
-              { provider: '', model: 'nope' },
+              { provider: 'openai' },
+              'nonsense',
             ],
           },
           { title: 'No prompt', agent: 'default' },
-          'not an object',
+          { prompt: 'No title', agent: 'default' },
+          null,
         ],
       }),
     ).toEqual([
@@ -88,20 +96,26 @@ describe('parseExamplePrompts', () => {
         models: [{ provider: 'claude-code', model: 'claude-sonnet-5-5' }],
       },
     ])
+  })
+
+  it('reads anything else as no prompts', () => {
     expect(parseExamplePrompts(null)).toEqual([])
+    expect(parseExamplePrompts({ prompts: 'x' })).toEqual([])
   })
 })
 
 describe('fetchExamplePrompts', () => {
-  // Braces on purpose: `mockReset()` returns the mock, and a function
-  // returned from `beforeEach` is run as cleanup.
   beforeEach(() => {
     trigger.mockReset()
   })
 
-  it('returns what the ADE serves, and nothing for a project that declares none', async () => {
-    trigger.mockResolvedValue({ prompts: [] })
-    expect(await fetchExamplePrompts()).toEqual([])
+  it('asks the ADE backend for the project’s prompts', async () => {
+    trigger.mockResolvedValue({
+      prompts: [{ title: 'T', agent: 'default', prompt: 'P', models: [] }],
+    })
+    await expect(fetchExamplePrompts()).resolves.toEqual([
+      { title: 'T', agent: 'default', prompt: 'P', models: [] },
+    ])
     expect(trigger).toHaveBeenCalledWith(
       'console::onboarding::prompts',
       {},
@@ -109,14 +123,10 @@ describe('fetchExamplePrompts', () => {
     )
   })
 
-  it('falls back to the harness template’s four when the ADE predates the function', async () => {
-    trigger.mockRejectedValue(
-      new Error('Function console::onboarding::prompts not found'),
-    )
-    const prompts = await fetchExamplePrompts()
-    expect(prompts).toHaveLength(4)
-    expect(prompts.map((prompt) => prompt.title)).toEqual(
-      HARNESS_PROMPTS.map((prompt) => prompt.title),
-    )
+  it('shows none on a backend that predates them', async () => {
+    trigger.mockImplementation(async () => {
+      throw { code: 'function_not_found' }
+    })
+    await expect(fetchExamplePrompts()).resolves.toEqual([])
   })
 })

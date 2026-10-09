@@ -65,10 +65,11 @@ iii trigger compose::add worker=harness
 The provider workers install with the harness, but they need credentials before any model appears — until then the model picker reads **no models** and chat won't generate. The first time a person loads the ADE on a machine it opens a setup wizard that does this for you — never in a browser under automation (an e2e run, an agent's browser session), which gets the page it asked for. Reopen it any time from the command palette: **Set up the harness**.
 
 1. **Models** — `console::onboarding::scan` looks for the Claude Code and Codex CLIs and whether each is signed in (presence and paths only, never a credential), and the step recommends what it found: a signed-in Claude Code or Codex adds [`provider-claude-code`](https://github.com/iii-hq/workers/tree/main/provider-claude-code) / [`provider-openai-codex`](https://github.com/iii-hq/workers/tree/main/provider-openai-codex) and needs no key; a CLI installed but not signed in says what to do, then **Scan again**. The [`secrets`](https://github.com/iii-hq/workers/tree/main/secrets) worker comes with `llm-router` (a dependency, so the wizard never asks to add it), and `secrets::detect` looks for provider keys in your shell profile and the project's `.env`, shows them masked (`sk-ant…9f2c`) and recommends their providers. Each key is kept where you choose: **Encrypted** (the default; a found key is imported by the secrets worker itself, a pasted one is stored there) or **Environment variable** (the variable already in `.env` is shared as it is, or a pasted key is written to `.env`). Either way only a reference, `secret://ANTHROPIC_API_KEY` or `env://ANTHROPIC_API_KEY`, is written to the `llm-router` configuration, so no key lands in `./config`. The same choice is in each provider's key field in the model picker and in **Settings → Workers → llm-router**. Every other provider worker in the registry is listed too.
-2. **Judge** (optional) — adds [`judge`](https://github.com/iii-hq/workers/tree/main/judge) with Jev ([`judge-typesafe`](https://github.com/iii-hq/workers/tree/main/judge-typesafe), its `TYPESAFE_API_KEY` behind a `secret://` reference) or a local judge, and explains where the harness uses it.
-3. **Ready** — what is connected and every worker setup added. With a model connected, it offers to keep going with the guided tour of the ADE: **Start the tour** adds the [`onboarding`](https://github.com/iii-hq/workers/tree/main/onboarding) worker if it is not running and opens its page beside the chat, where it walks through the ADE stage by stage. **Skip the tour** goes straight to the composer.
+2. **Browser** (shown only when the [`browser`](https://github.com/iii-hq/workers/tree/main/browser) worker is installed and `browser::chromium::status` finds no Chromium) — one click on **Download Chromium** runs `browser::chromium::install` (about 200 MB, once per machine) and follows its `browser::chromium-install-progress` events; **I'd rather install it myself** shows the command for the OS and **Check again**. The command palette's **Install Chromium for the browser worker** and an **Install Chromium** action on a failed `browser::*` call (`chromium_missing`) open the wizard on this step.
+3. **Judge** (optional) — adds [`judge`](https://github.com/iii-hq/workers/tree/main/judge) with Jev ([`judge-typesafe`](https://github.com/iii-hq/workers/tree/main/judge-typesafe), its `TYPESAFE_API_KEY` stored encrypted by `secrets`) or a local judge, and explains where the harness uses it.
+4. **Ready** — what is connected, every worker setup added, and the project's example prompts. **Finish** closes the wizard. The prompts come from `onboarding.yaml` in the project folder (`console::onboarding::prompts`, read on each call; a missing or invalid file shows none): each one has a `title`, an optional `description`, the `agent` profile it runs with, the `prompt`, and `models`, a priority list of `{ provider, model, effort? }`. Clicking one opens a new chat with the prompt in the message box (not sent), its agent profile selected, and the first listed model the router serves here, at that effort; with none available the chat keeps its usual model.
 
-Nothing is added without a click: each step lists the exact actions it will run — `compose::add` with each worker and why, `secrets::import` / `secrets::set`, the configuration value written — and, once you continue, logs them live with the compose phase of each worker being added. Finishing or skipping is remembered per machine in `<data_dir>/onboarding.json` (`console::onboarding::get` / `::set`).
+Nothing is added without a click, and every worker a step adds is named before it runs and logged as it is added: iii is composable, and each worker adds behavior to the project (`worker-compose.yaml`). The wizard keeps everything else in plain words (no function ids, configuration entries, key references or paths); the actions behind each step are `compose::add`, `secrets::import` / `secrets::set` and a configuration write. Finishing or skipping is remembered per machine in `<data_dir>/onboarding.json` (`console::onboarding::get` / `::set`).
 
 The wizard opens by itself only where it can help: never once a model is connected (the router already serves one from a running provider worker), never when the router cannot answer, and never where it is turned off. A deployed ADE starts with an empty data directory, which reads as a first run, so turn it off there: `onboarding.auto_open: false` in the ADE configuration (**Settings → Workers → ADE → Setup**), or `III_CONSOLE_ONBOARDING_AUTO_OPEN=false` in the worker's environment for one environment whatever the configuration says. `console::onboarding::get` reports the result as `auto_open`. The command palette opens the wizard either way.
 
@@ -143,6 +144,23 @@ Use **Import conversations** in the chat sidebar to discover, preview, and selec
 
 Deploy the matching ADE and Harness changes so a session with imported history and no prior turn requires its initial ADE model and working directory. Sessions that explicitly carry `read_only: true` remain protected.
 
+### Mentions
+
+Workers define what a chat can mention (see
+[`crates/mention-contract`](../crates/mention-contract/README.md)). In the
+composer, `@` lists the providers beside functions and files, and from two
+characters on searches every provider, one group each; Tab (or Enter) on a
+provider scopes the menu to `@<provider>:` and its own search. A picked item
+is inserted as `@<provider>(id="…")` and shows as a pill with its icon and
+name, in the composer and in sent messages; hovering a pill shows the item's
+preview card — the generic one, or the worker's own
+(`host.mentions.registerRenderer`) — and clicking it opens the item. What
+the agent was told about the mentions shows as a quiet "Context for the
+agent" row in the turn. The console itself provides `@trace`:
+`console::mentions::trace::search` / `console::mentions::trace::get` wrap
+`engine::traces::list`, and a trace pill opens the traces screen on that
+trace.
+
 ### Traces
 
 Full-fledged OpenTelemetry explorer over `engine::traces::*` and `engine::logs::list`. Lives in [`web/src/pages/TracesV2/`](web/src/pages/TracesV2).
@@ -152,7 +170,7 @@ Full-fledged OpenTelemetry explorer over `engine::traces::*` and `engine::logs::
 - **Rich filtering** — status, time presets, min/max duration, arbitrary attribute key/value pairs, debounced free-text search, saved views
 - **Group by** — server-side aggregation with lazy per-group member expansion
 - **Span detail tabs** — info, attributes, events, errors, OTel logs, context (baggage), links
-- **Live streaming** — spans append over iii streams (`iii:devtools:*`) instead of polling; one seed read, then append
+- **Live updates** — the engine's coalesced `trace` trigger (trace ids only) drives a re-read of the touched traces; one seed read, then notify-then-query, no polling and no stream worker
 
 ### Worktrees
 
@@ -330,7 +348,9 @@ redaction for normalized registration/fired/retirement activities, with host
 fallbacks for every slot), and
 `host.configForms` (provide the deliberate form body for one configuration id
 inside global Settings; dirty/save/reset and schema validation stay
-host-owned). There is no generic schema-generated form fallback. A
+host-owned), and `host.mentions` (draw the hover preview of the worker's own
+`@<provider>(id=…)` chat mentions; the generic card covers a renderer that
+is absent or throws). There is no generic schema-generated form fallback. A
 configuration form can opt into `{ layout: 'full' }` to receive the entire
 available editor width and height; contained layout remains the default.
 Renders are fenced by an ErrorBoundary and scoped under

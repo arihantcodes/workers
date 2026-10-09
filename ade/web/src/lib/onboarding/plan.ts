@@ -3,10 +3,10 @@
  * before anything runs: which providers to recommend from what was found on
  * this machine, and the exact list of engine actions a choice turns into.
  *
- * Transparency is the point of the plan: every worker the wizard adds, every
- * secret it stores and every configuration value it writes is a `PlanStep`
- * the user reads before pressing the button, and the same steps become the
- * activity log while they run.
+ * Every action is a `PlanStep` the user reads before pressing the button,
+ * and the same steps become the activity log while they run. They read as
+ * short sentences for someone exploring iii: the one thing they always name
+ * is a worker being added, since each one brings new behavior to the project.
  */
 
 import {
@@ -21,7 +21,10 @@ import {
   sourceLabel,
 } from '@/lib/secrets'
 import {
+  DEVICE_PROVIDERS,
+  type DeviceProvider,
   JUDGE_HUB_WORKER,
+  JUDGE_OPTIONS,
   type JudgeOption,
   KEY_PROVIDERS,
   type KeyProvider,
@@ -57,6 +60,20 @@ export interface ProviderState {
   credentialSource?: string
   credentialRef?: string
   credentialError?: string
+  /**
+   * The provider declares no credential env var: it signs in by itself (OAuth,
+   * device flow, a local CLI) and the router holds no key for it, so it
+   * reports `configured: false` even when its models are usable.
+   */
+  ownsAuthentication?: boolean
+}
+
+/** Its models are usable: it has some, and a credential or its own sign-in. */
+export function servesUsableModels(provider: ProviderState): boolean {
+  return (
+    provider.modelCount > 0 &&
+    (provider.configured || provider.ownsAuthentication === true)
+  )
 }
 
 interface BaseChoice {
@@ -88,6 +105,12 @@ export interface KeyChoice extends BaseChoice {
   credentialError?: string
 }
 
+/** Signs in with a device flow from the ADE (GitHub Copilot). */
+export interface DeviceChoice extends BaseChoice {
+  kind: 'device'
+  provider: DeviceProvider
+}
+
 /** A provider worker from the registry the wizard has no recipe for. */
 export interface RegistryChoice extends BaseChoice {
   kind: 'registry'
@@ -95,7 +118,11 @@ export interface RegistryChoice extends BaseChoice {
   version: string | null
 }
 
-export type ProviderChoice = SubscriptionChoice | KeyChoice | RegistryChoice
+export type ProviderChoice =
+  | SubscriptionChoice
+  | KeyChoice
+  | DeviceChoice
+  | RegistryChoice
 
 /** The registry row a `RegistryChoice` is built from. */
 export interface RegistryProviderRow {
@@ -105,27 +132,21 @@ export interface RegistryProviderRow {
 }
 
 /**
- * Registry provider workers the wizard's catalog does not cover: offered as
- * "add the worker, configure it afterwards". One already running stays in
- * the list, marked connected, so every provider keeps its place whatever
- * its state.
+ * Registry provider workers that are neither in the wizard's catalog nor
+ * already running: offered as "add the worker, configure it afterwards".
  */
 export function registryChoices(
   rows: readonly RegistryProviderRow[],
   installedWorkers: ReadonlySet<string>,
   known: readonly ProviderChoice[],
-  providers: readonly ProviderState[] = [],
 ): RegistryChoice[] {
   const knownWorkers = new Set(known.map((choice) => choice.worker))
-  const byProvider = new Map(providers.map((entry) => [entry.id, entry]))
   return rows
-    .filter((row) => !knownWorkers.has(row.name))
+    .filter(
+      (row) => !knownWorkers.has(row.name) && !installedWorkers.has(row.name),
+    )
     .map((row) => {
       const providerId = row.name.replace(/^provider-/, '')
-      const installed = installedWorkers.has(row.name)
-      const modelCount = installed
-        ? (byProvider.get(providerId)?.modelCount ?? 0)
-        : 0
       const title =
         REGISTRY_TITLES[providerId] ??
         providerId
@@ -139,29 +160,22 @@ export function registryChoices(
         title,
         description: row.description,
         version: row.version,
-        ready: modelCount > 0,
-        installed,
+        ready: false,
+        installed: false,
         recommended: false,
-        reason:
-          firstSentence(row.description) ??
-          'A provider worker from the registry.',
-        modelCount,
+        // Registry descriptions are written for worker authors; the wizard
+        // only says what happens next.
+        reason: 'Set it up after it is added.',
+        modelCount: 0,
       }
     })
 }
 
 /** Names a slug cannot spell: brand casing and punctuation. */
 const REGISTRY_TITLES: Record<string, string> = {
-  'github-copilot': 'GitHub Copilot',
   llamacpp: 'llama.cpp',
   'llama-cpp': 'llama.cpp',
   'opencode-go': 'OpenCode Go',
-}
-
-function firstSentence(text: string | null): string | null {
-  if (!text) return null
-  const end = text.search(/[.;](\s|$)/)
-  return (end > 0 ? text.slice(0, end) : text).trim() || null
 }
 
 export interface ChoiceInputs {
@@ -228,10 +242,53 @@ export function providerChoices({
     }
   })
 
+  const devices: DeviceChoice[] = DEVICE_PROVIDERS.map((provider) => {
+    const state = byProvider.get(provider.providerId)
+    const ready = state !== undefined && servesUsableModels(state)
+    return {
+      kind: 'device',
+      provider,
+      providerId: provider.providerId,
+      worker: provider.worker,
+      title: provider.title,
+      ready,
+      installed: state?.available === true,
+      recommended: false,
+      reason: ready
+        ? `Connected — models from ${provider.plan}.`
+        : `Sign in with GitHub in your browser — uses ${provider.plan}, no API key.`,
+      modelCount: state?.modelCount ?? 0,
+    }
+  })
+
   const rank = (choice: ProviderChoice) =>
     choice.ready ? 0 : choice.recommended ? 1 : 2
+  // Any other running provider that already serves usable models (Copilot,
+  // llama.cpp): the wizard has no recipe for it but shows it as connected.
+  const known = new Set(
+    [...subscriptions, ...keys, ...devices].map((choice) => choice.providerId),
+  )
+  const others: RegistryChoice[] = providers
+    .filter(
+      (state) =>
+        !known.has(state.id) && state.available && servesUsableModels(state),
+    )
+    .map((state) => ({
+      kind: 'registry',
+      providerId: state.id,
+      worker: `provider-${state.id}`,
+      title: state.title,
+      description: null,
+      version: null,
+      ready: true,
+      installed: true,
+      recommended: false,
+      reason: 'Connected.',
+      modelCount: state.modelCount,
+    }))
+
   // Stable: catalog order inside each rank.
-  return [...subscriptions, ...keys]
+  return [...subscriptions, ...keys, ...devices, ...others]
     .map((choice, index) => ({ choice, index }))
     .sort((a, b) => rank(a.choice) - rank(b.choice) || a.index - b.index)
     .map(({ choice }) => choice)
@@ -243,15 +300,17 @@ function subscriptionReason(
   ready: boolean,
 ): string {
   if (ready) return `Connected — models from ${provider.plan}.`
+  // The provider reads only the sign-in; the CLI program may be absent (a
+  // desktop app signs in to the same file).
+  if (tool?.signed_in) {
+    return `${provider.title} is signed in on this machine — uses ${provider.plan}, no API key.`
+  }
   if (!tool?.installed) {
-    return `${provider.title} was not found on this machine.`
+    return `${provider.title} is not signed in on this machine.`
   }
-  if (!tool.signed_in) {
-    return tool.sign_in_note
-      ? `${provider.title} is installed, but ${tool.sign_in_note}.`
-      : `${provider.title} is installed but not signed in. Sign in with the ${provider.title} CLI, then scan again.`
-  }
-  return `${provider.title} is signed in on this machine — uses ${provider.plan}, no API key.`
+  return tool.sign_in_note
+    ? `${provider.title} is installed, but ${tool.sign_in_note}.`
+    : `${provider.title} is installed but not signed in. Sign in with the ${provider.title} CLI, then scan again.`
 }
 
 function keyReason(
@@ -260,12 +319,11 @@ function keyReason(
   ready: boolean,
 ): string {
   if (ready) return 'Connected.'
-  if (detection?.stored) {
-    return `${provider.envVar} is already in the secrets store.`
-  }
+  if (detection?.stored) return 'Your key is already saved on this machine.'
   const source = preferredSource(detection)
-  if (source) return `Found ${provider.envVar} in ${sourceLabel(source)}.`
-  return `Needs an API key (${provider.envVar}).`
+  if (source)
+    return `Found your ${provider.title} key in ${sourceLabel(source)}.`
+  return 'Needs an API key.'
 }
 
 /* ------------------------------------------------------------------ */
@@ -285,8 +343,8 @@ export type PlanStep =
       kind: 'store-secret'
       name: string
       input: KeyInput
-      /** Human description of where the value comes from. */
-      from: string
+      /** Whose key it is, as the user knows it (`Anthropic`). */
+      owner: string
       consumers: string[]
       /** The secrets worker's env file, by name, for an env store key. */
       envFile?: string
@@ -298,6 +356,8 @@ export type PlanStep =
       /** Dotted path inside the entry value. */
       path: string[]
       value: string
+      /** What the value is for, as the user knows it (`Anthropic`, `Laya`). */
+      owner: string
     }
   | { kind: 'wait-models'; providerId: string; title: string }
   /** Ask the judge hub for its models: proves the strategy answers, key included. */
@@ -320,7 +380,7 @@ export function connectPlan(
   installedWorkers: ReadonlySet<string>,
   /** The secrets worker's env file, by name. */
   envFile: string = DEFAULT_ENV_FILE,
-  /** Connected providers the user unchecked: removed last. */
+  /** Connected providers the person unchecked: removed after everything else. */
   removals: readonly ProviderChoice[] = [],
 ): PlanStep[] {
   const pending = selections.filter(({ choice }) => !choice.ready)
@@ -336,16 +396,15 @@ export function connectPlan(
   // llm-router depends on it, so it is normally running already; a project
   // set up before that gets it here, without a question of its own.
   if (keyed.length > 0 && !installedWorkers.has(SECRETS_WORKER)) {
-    why[SECRETS_WORKER] =
-      'Keeps API keys encrypted or in this project’s .env, outside every file you commit.'
+    why[SECRETS_WORKER] = SECRETS_WHY
   }
   for (const { choice } of pending) {
     if (choice.installed || installedWorkers.has(choice.worker)) continue
     why[choice.worker] =
       choice.kind === 'subscription'
-        ? `Serves ${choice.title} models from ${choice.provider.plan}.`
+        ? `Lets agents use ${choice.title} models, from ${choice.provider.plan}.`
         : choice.kind === 'key'
-          ? `Serves ${choice.title} models through llm-router.`
+          ? `Lets agents use ${choice.title} models.`
           : `Adds ${choice.title}; finish its sign-in or key in the model picker.`
   }
 
@@ -355,8 +414,9 @@ export function connectPlan(
   for (const { choice, key } of keyed) {
     if (choice.kind !== 'key' || !key) continue
     steps.push(
-      ...keyReferenceSteps(
+      keyStep(
         choice.provider.envVar,
+        choice.title,
         key,
         ['llm-router'],
         envFile,
@@ -367,6 +427,7 @@ export function connectPlan(
       configuration: ROUTER_CONFIGURATION,
       path: ['providers', choice.providerId, 'api_key'],
       value: keyReference(choice.provider.envVar, key),
+      owner: choice.title,
     })
   }
   // A registry provider the wizard has no recipe for may need a sign-in
@@ -382,7 +443,7 @@ export function connectPlan(
   return [...steps, ...removing]
 }
 
-/** One `compose::remove` for whichever of `workers` is running. */
+/** One `remove-workers` step for the named workers that are running. */
 function removeStep(
   workers: readonly string[],
   installedWorkers: ReadonlySet<string>,
@@ -395,34 +456,67 @@ function removeStep(
     : []
 }
 
+/** Why the secrets worker is added, when a key needs it. */
+const SECRETS_WHY = 'Keeps your API keys safe, outside every file you commit.'
+
 /**
  * Put the key where `key` says for `consumers` — or, when it is already
  * there, make sure they may read it. An import's value never passes through
  * the browser.
  */
-function keyReferenceSteps(
+function keyStep(
   name: string,
+  owner: string,
   key: KeyInput,
   consumers: string[],
   envFile: string = DEFAULT_ENV_FILE,
-): PlanStep[] {
-  return [
-    {
-      kind: 'store-secret',
-      name,
-      input: key,
-      from:
-        key.mode === 'paste'
-          ? 'the key you pasted'
-          : key.mode === 'stored'
-            ? 'the secrets store'
-            : key.mode === 'env'
-              ? `this project’s ${envFile}`
-              : sourceLabel(key.source),
-      consumers,
-      ...(keyStore(key) === 'env' ? { envFile } : {}),
-    },
-  ]
+): PlanStep {
+  return {
+    kind: 'store-secret',
+    name,
+    input: key,
+    owner,
+    consumers,
+    ...(keyStore(key) === 'env' ? { envFile } : {}),
+  }
+}
+
+/**
+ * The option Judge answers with now: the hub's `provider` when its worker is
+ * installed, else the first installed option. More than one judge worker can
+ * be running (a key shared with the OpenAI provider makes that common), so the
+ * first installed one is not necessarily the one in use.
+ */
+export function activeJudge(
+  installed: ReadonlySet<string>,
+  provider: string | null,
+): JudgeOption | undefined {
+  const running = JUDGE_OPTIONS.filter((option) => installed.has(option.worker))
+  return running.find((option) => option.id === provider) ?? running[0]
+}
+
+/**
+ * The workers setting Judge up with `option` adds, each with what it brings:
+ * the secrets worker (only for a hosted judge's key), the `judge` hub, and
+ * the option's own worker — whichever is not running yet.
+ */
+export function judgeWorkers(
+  option: JudgeOption,
+  installedWorkers: ReadonlySet<string>,
+  withKey = option.envVar !== undefined,
+): Record<string, string> {
+  const why: Record<string, string> = {}
+  if (option.envVar && withKey && !installedWorkers.has(SECRETS_WORKER)) {
+    why[SECRETS_WORKER] = SECRETS_WHY
+  }
+  if (!installedWorkers.has(JUDGE_HUB_WORKER)) {
+    why[JUDGE_HUB_WORKER] =
+      'Answers the small decisions agents make along the way.'
+  }
+  if (!installedWorkers.has(option.worker)) {
+    why[option.worker] = `Runs ${option.title}, the model behind those answers.`
+  }
+  return why
 }
 
 export interface JudgeSelection {
@@ -462,34 +556,25 @@ export function judgePlan(
     )
   }
   const why: Record<string, string> = {}
-  const keyed = selections.filter(
-    ({ option, key }) =>
-      option.envVar && key && !installedWorkers.has(option.worker),
-  )
-  if (keyed.length > 0 && !installedWorkers.has(SECRETS_WORKER)) {
-    why[SECRETS_WORKER] =
-      'Stores API keys encrypted, outside every file you commit.'
-  }
-  if (!hubRunning) {
-    why[JUDGE_HUB_WORKER] =
-      'The hub harness, function search and the browser ask for decisions.'
-  }
-  for (const { option } of selections) {
-    if (!installedWorkers.has(option.worker)) {
-      why[option.worker] = `Answers those decisions with ${option.title}.`
-    }
+  for (const { option, key } of selections) {
+    Object.assign(why, judgeWorkers(option, installedWorkers, Boolean(key)))
   }
   const steps: PlanStep[] = []
   const workers = Object.keys(why)
   if (workers.length > 0) steps.push({ kind: 'add-workers', workers, why })
-  for (const { option, key } of keyed) {
-    if (!option.envVar || !key) continue
-    steps.push(...keyReferenceSteps(option.envVar, key, [option.worker]))
+  for (const { option, key } of selections) {
+    if (!option.envVar || !key || installedWorkers.has(option.worker)) continue
+    steps.push(
+      keyStep(option.envVar, option.keyOwner ?? option.title, key, [
+        option.worker,
+      ]),
+    )
     steps.push({
       kind: 'set-config',
       configuration: option.worker,
       path: ['api_key'],
       value: keyReference(option.envVar, key),
+      owner: option.title,
     })
   }
   const primary = selections[0].option
@@ -500,6 +585,7 @@ export function judgePlan(
       configuration: JUDGE_HUB_WORKER,
       path: ['provider'],
       value: primary.id,
+      owner: primary.title,
     })
   }
   if (workers.length > 0 || changesDefault) {
@@ -518,67 +604,69 @@ export function judgePlan(
   ]
 }
 
-/** One line per step, as the plan preview and the activity log show it. */
-export function describeStep(step: PlanStep): {
-  title: string
-  detail: string
-} {
+/**
+ * One short sentence per step, as the plan preview and the activity log show
+ * it. Plain words for someone exploring iii: the worker being added is named,
+ * function ids, references and configuration entries are not.
+ */
+export function describeStep(step: PlanStep): string {
   switch (step.kind) {
     case 'add-workers':
-      return {
-        title:
-          step.workers.length === 1
-            ? `Add the ${step.workers[0]} worker`
-            : `Add ${step.workers.length} workers`,
-        detail: `compose::add ${step.workers.join(' ')}`,
-      }
+      return step.workers.length === 1
+        ? `Add the ${step.workers[0]} worker`
+        : `Add ${step.workers.length} workers: ${joinNames(step.workers)}`
     case 'remove-workers':
-      return {
-        title:
-          step.workers.length === 1
-            ? `Remove the ${step.workers[0]} worker`
-            : `Remove ${step.workers.length} workers`,
-        detail: `compose::remove ${step.workers.join(' ')}`,
-      }
+      return step.workers.length === 1
+        ? `Remove the ${step.workers[0]} worker`
+        : `Remove ${step.workers.length} workers: ${joinNames(step.workers)}`
     case 'store-secret': {
-      const reference = keyReference(step.name, step.input)
-      const readers = step.consumers.join(', ')
-      if (step.input.mode === 'stored' || step.input.mode === 'env') {
-        return {
-          title:
-            step.input.mode === 'env'
-              ? `Let ${readers} read ${step.name} from ${step.from}`
-              : `Let ${readers} read ${step.name}`,
-          detail: `secrets::access ${step.name} → ${reference}`,
-        }
+      const envFile = step.envFile ?? DEFAULT_ENV_FILE
+      if (step.input.mode === 'stored') {
+        return `Use your ${step.owner} key already saved on this machine`
       }
-      const call = `secrets::${step.input.mode === 'import' ? 'import' : 'set'}`
+      if (step.input.mode === 'env') {
+        return `Use your ${step.owner} key from this project’s ${envFile}`
+      }
       return keyStore(step.input) === 'env'
-        ? {
-            title: `Write ${step.name} to this project’s ${step.envFile ?? DEFAULT_ENV_FILE}, from ${step.from}`,
-            detail: `${call} ${step.name} store=env → ${reference}`,
-          }
-        : {
-            title: `Store ${step.name} encrypted, from ${step.from}`,
-            detail: `${call} ${step.name} → ${reference}`,
-          }
+        ? `Save your ${step.owner} key in this project’s ${envFile}`
+        : `Store your ${step.owner} key encrypted on this machine`
     }
     case 'set-config':
-      return {
-        title: `Point ${step.configuration} at ${step.value}`,
-        detail: `${step.configuration} · ${step.path.join('.')} = ${step.value}`,
-      }
+      return step.path[step.path.length - 1] === 'api_key'
+        ? `Connect ${step.owner} with that key`
+        : `Have Judge answer with ${step.owner}`
     case 'wait-models':
-      return {
-        title: `Wait for ${step.title} models`,
-        detail: `router::models::list provider=${step.providerId}`,
-      }
+      return `Check that ${step.title} models are ready`
     case 'check-judge':
-      return {
-        title: `Ask ${step.title} for its models`,
-        detail: 'judge::models::list',
-      }
+      return `Check that ${step.title} answers`
   }
+}
+
+/**
+ * The engine operation behind a step, as the setup log prints it under the
+ * sentence: the command a terminal would show.
+ */
+export function stepDetail(step: PlanStep): string {
+  switch (step.kind) {
+    case 'add-workers':
+      return `compose::add ${step.workers.join(' ')}`
+    case 'remove-workers':
+      return `compose::remove ${step.workers.join(' ')}`
+    case 'store-secret':
+      return `secrets::${step.input.mode === 'paste' ? 'set' : 'access'} ${step.name}`
+    case 'set-config':
+      return `configuration::set ${step.configuration} ${step.path.join('.')}`
+    case 'wait-models':
+      return `router::models::list provider=${step.providerId}`
+    case 'check-judge':
+      return 'judge::models::list'
+  }
+}
+
+/** `a`, `a and b`, `a, b and c`. */
+function joinNames(names: readonly string[]): string {
+  if (names.length <= 1) return names.join('')
+  return `${names.slice(0, -1).join(', ')} and ${names[names.length - 1]}`
 }
 
 /** Set `path` inside a JSON object value, creating objects on the way. */

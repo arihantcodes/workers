@@ -3,6 +3,7 @@ import { envFileName } from '@/lib/secrets'
 import { JUDGE_OPTIONS, workerSource } from './catalog'
 import { shouldAutoOpenOnboarding } from './open'
 import {
+  activeJudge,
   connectPlan,
   describeStep,
   judgePlan,
@@ -10,8 +11,10 @@ import {
   type ProviderChoice,
   providerChoices,
   registryChoices,
+  servesUsableModels,
   setPath,
   sourceLabel,
+  stepDetail,
   type ToolScan,
 } from './plan'
 
@@ -66,8 +69,22 @@ describe('providerChoices', () => {
     expect(codex.recommended).toBe(false)
     expect(codex.reason).toMatch(/not signed in/)
     expect(byId(choices, 'anthropic').reason).toBe(
-      'Found ANTHROPIC_API_KEY in your shell profile.',
+      'Found your Anthropic key in your shell profile.',
     )
+  })
+
+  it('needs only the sign-in, not the CLI program (the desktop apps)', () => {
+    const choices = providerChoices({
+      tools: [
+        { ...signedIn('codex', 'provider-openai-codex'), installed: false },
+      ],
+      providers: [],
+      detections: [],
+    })
+    const codex = byId(choices, 'openai-codex')
+    expect(codex.recommended).toBe(true)
+    expect(codex.reason).toMatch(/signed in on this machine/)
+    expect(codex.reason).not.toMatch(/not found/)
   })
 
   it('puts providers that already serve models first and marks them ready', () => {
@@ -87,6 +104,108 @@ describe('providerChoices', () => {
     expect(choices[0].providerId).toBe('openai')
     expect(choices[0].ready).toBe(true)
     expect(choices[0].installed).toBe(true)
+  })
+
+  it('lists other running providers that serve models as connected', () => {
+    const choices = providerChoices({
+      tools: [],
+      providers: [
+        // Device flow: the router holds no credential, the worker does.
+        {
+          id: 'github-copilot',
+          title: 'GitHub Copilot',
+          configured: false,
+          ownsAuthentication: true,
+          available: true,
+          modelCount: 10,
+        },
+        // Keyless local server.
+        {
+          id: 'llamacpp',
+          title: 'llama.cpp',
+          configured: true,
+          available: true,
+          modelCount: 2,
+        },
+        // A key provider the wizard has no recipe for, with no key: its
+        // catalog is not usable, so it is not connected.
+        {
+          id: 'sarvam',
+          title: 'Sarvam',
+          configured: false,
+          available: true,
+          modelCount: 3,
+        },
+      ],
+      detections: [],
+    })
+    const copilot = byId(choices, 'github-copilot')
+    expect(copilot).toMatchObject({
+      ready: true,
+      installed: true,
+      worker: 'provider-github-copilot',
+      modelCount: 10,
+    })
+    expect(byId(choices, 'llamacpp').ready).toBe(true)
+    expect(choices.some((choice) => choice.providerId === 'sarvam')).toBe(false)
+  })
+})
+
+describe('device sign-in choices', () => {
+  it('offers GitHub Copilot with a browser sign-in until it serves models', () => {
+    const fresh = byId(
+      providerChoices({ tools: [], providers: [], detections: [] }),
+      'github-copilot',
+    )
+    expect(fresh).toMatchObject({
+      kind: 'device',
+      worker: 'provider-github-copilot',
+      ready: false,
+      installed: false,
+    })
+    expect(fresh.reason).toMatch(/GitHub/)
+
+    const signedIn = byId(
+      providerChoices({
+        tools: [],
+        providers: [
+          {
+            id: 'github-copilot',
+            title: 'GitHub Copilot',
+            configured: false,
+            ownsAuthentication: true,
+            available: true,
+            modelCount: 10,
+          },
+        ],
+        detections: [],
+      }),
+      'github-copilot',
+    )
+    expect(signedIn).toMatchObject({ kind: 'device', ready: true })
+  })
+})
+
+describe('servesUsableModels', () => {
+  it('needs models and either a credential or its own authentication', () => {
+    const state = {
+      id: 'x',
+      title: 'X',
+      available: true,
+      modelCount: 4,
+    }
+    expect(servesUsableModels({ ...state, configured: true })).toBe(true)
+    expect(
+      servesUsableModels({
+        ...state,
+        configured: false,
+        ownsAuthentication: true,
+      }),
+    ).toBe(true)
+    expect(servesUsableModels({ ...state, configured: false })).toBe(false)
+    expect(
+      servesUsableModels({ ...state, configured: true, modelCount: 0 }),
+    ).toBe(false)
   })
 })
 
@@ -132,11 +251,24 @@ describe('connectPlan', () => {
       configuration: 'llm-router',
       path: ['providers', 'anthropic', 'api_key'],
       value: 'secret://ANTHROPIC_API_KEY',
+      owner: 'Anthropic',
     })
     const store = plan[1]
     if (store.kind !== 'store-secret') throw new Error('expected store-secret')
     expect(store.consumers).toEqual(['llm-router'])
-    expect(store.from).toBe('your shell profile')
+    // Short sentences for someone exploring iii; only workers are named.
+    expect(plan.map(describeStep)).toEqual([
+      'Add 2 workers: secrets and provider-claude-code',
+      'Store your Anthropic key encrypted on this machine',
+      'Connect Anthropic with that key',
+      'Check that Claude Code models are ready',
+      'Check that Anthropic models are ready',
+    ])
+    for (const step of plan) {
+      expect(describeStep(step)).not.toMatch(
+        /secret:\/\/|env:\/\/|::|llm-router|ANTHROPIC_API_KEY/,
+      )
+    }
   })
 
   it('never puts a pasted key in a description', () => {
@@ -150,8 +282,7 @@ describe('connectPlan', () => {
       new Set(['secrets']),
     )
     for (const step of plan) {
-      const { title, detail } = describeStep(step)
-      expect(`${title} ${detail}`).not.toContain('very-secret')
+      expect(describeStep(step)).not.toContain('very-secret')
     }
   })
 
@@ -165,8 +296,8 @@ describe('connectPlan', () => {
       'set-config',
       'wait-models',
     ])
-    expect(describeStep(plan[0]).title).toBe(
-      'Let llm-router read ANTHROPIC_API_KEY',
+    expect(describeStep(plan[0])).toBe(
+      'Use your Anthropic key already saved on this machine',
     )
   })
 
@@ -175,10 +306,9 @@ describe('connectPlan', () => {
       [{ choice: byId(choices, 'anthropic'), key: { mode: 'env' } }],
       new Set(['secrets', 'provider-anthropic']),
     )
-    expect(describeStep(shared[0])).toEqual({
-      title: 'Let llm-router read ANTHROPIC_API_KEY from this project’s .env',
-      detail: 'secrets::access ANTHROPIC_API_KEY → env://ANTHROPIC_API_KEY',
-    })
+    expect(describeStep(shared[0])).toBe(
+      'Use your Anthropic key from this project’s .env',
+    )
     expect(shared[1]).toMatchObject({
       kind: 'set-config',
       path: ['providers', 'anthropic', 'api_key'],
@@ -197,14 +327,9 @@ describe('connectPlan', () => {
       ],
       new Set(['secrets', 'provider-anthropic']),
     )
-    const { title, detail } = describeStep(pasted[0])
-    expect(title).toBe(
-      'Write ANTHROPIC_API_KEY to this project’s .env, from the key you pasted',
-    )
-    expect(detail).toBe(
-      'secrets::set ANTHROPIC_API_KEY store=env → env://ANTHROPIC_API_KEY',
-    )
-    expect(`${title} ${detail}`).not.toContain('very-secret')
+    const title = describeStep(pasted[0])
+    expect(title).toBe('Save your Anthropic key in this project’s .env')
+    expect(title).not.toContain('very-secret')
     expect(pasted[1]).toMatchObject({ value: 'env://ANTHROPIC_API_KEY' })
     // A namespace whose secrets worker uses another env file says so.
     const staging = connectPlan(
@@ -221,8 +346,8 @@ describe('connectPlan', () => {
       new Set(['secrets', 'provider-anthropic']),
       '.env.staging',
     )
-    expect(describeStep(staging[0]).title).toBe(
-      'Write ANTHROPIC_API_KEY to this project’s .env.staging, from the key you pasted',
+    expect(describeStep(staging[0])).toBe(
+      'Save your Anthropic key in this project’s .env.staging',
     )
   })
 
@@ -249,44 +374,20 @@ describe('connectPlan', () => {
     const [extra] = registryChoices(
       [
         {
-          name: 'provider-github-copilot',
-          description:
-            'GitHub Copilot subscription provider worker; sign in once.',
+          name: 'provider-sarvam',
+          description: 'Sarvam provider worker; needs SARVAM_API_KEY.',
           version: '0.1.11',
         },
       ],
       new Set(),
       choices,
     )
-    expect(extra.title).toBe('GitHub Copilot')
-    expect(extra.reason).toBe('GitHub Copilot subscription provider worker')
+    expect(extra.title).toBe('Sarvam')
+    expect(extra.reason).toBe('Set it up after it is added.')
     expect(
       connectPlan([{ choice: extra }], new Set()).map((s) => s.kind),
     ).toEqual(['add-workers'])
   })
-
-  it('keeps a running registry provider in the list, connected', () => {
-    const [copilot] = registryChoices(
-      [{ name: 'provider-github-copilot', description: null, version: null }],
-      new Set(['provider-github-copilot']),
-      choices,
-      [
-        {
-          id: 'github-copilot',
-          title: 'GitHub Copilot',
-          configured: true,
-          available: true,
-          modelCount: 2,
-        },
-      ],
-    )
-    expect(copilot).toMatchObject({
-      installed: true,
-      ready: true,
-      modelCount: 2,
-    })
-  })
-
   it('removes a connected provider the user unchecked, after everything else', () => {
     const claude = byId(choices, 'claude-code')
     const plan = connectPlan(
@@ -300,10 +401,8 @@ describe('connectPlan', () => {
       'wait-models',
       'remove-workers',
     ])
-    expect(describeStep(plan[2])).toEqual({
-      title: 'Remove the provider-anthropic worker',
-      detail: 'compose::remove provider-anthropic',
-    })
+    expect(describeStep(plan[2])).toBe('Remove the provider-anthropic worker')
+    expect(stepDetail(plan[2])).toBe('compose::remove provider-anthropic')
     // Nothing to add: the removal is the whole plan.
     expect(
       connectPlan([], new Set(['provider-anthropic']), '.env', [
@@ -313,7 +412,60 @@ describe('connectPlan', () => {
   })
 })
 
+describe('activeJudge', () => {
+  const both = new Set(['judge', 'judge-typesafe', 'judge-openai'])
+
+  it('is the option the hub answers with, not the first installed one', () => {
+    expect(activeJudge(both, 'openai')?.id).toBe('openai')
+    expect(activeJudge(both, 'typesafe')?.id).toBe('typesafe')
+  })
+
+  it('falls back to the first installed option without a usable provider', () => {
+    expect(activeJudge(both, null)?.id).toBe('typesafe')
+    // The hub names a judge whose worker is gone.
+    expect(activeJudge(both, 'clef')?.id).toBe('typesafe')
+    expect(activeJudge(new Set(['judge']), 'openai')).toBeUndefined()
+  })
+})
+
 describe('judgePlan', () => {
+  it('lists the judges hosted first, then the local ones', () => {
+    expect(JUDGE_OPTIONS.map((option) => option.id)).toEqual([
+      'typesafe',
+      'openai',
+      'clef',
+      'laya',
+      'decider',
+    ])
+  })
+
+  it('sets up OpenAI with the key the OpenAI provider may already share', () => {
+    const openai = JUDGE_OPTIONS.find((option) => option.id === 'openai')
+    if (!openai) throw new Error('no openai')
+    const plan = judgePlan(
+      [{ option: openai, key: { mode: 'paste', value: 'sk-test-123456' } }],
+      new Set(['secrets', 'judge']),
+    )
+    expect(plan[1]).toMatchObject({
+      kind: 'store-secret',
+      name: 'OPENAI_API_KEY',
+      consumers: ['judge-openai'],
+    })
+    expect(plan[2]).toMatchObject({
+      configuration: 'judge-openai',
+      path: ['api_key'],
+      value: 'secret://OPENAI_API_KEY',
+    })
+    expect(plan[3]).toMatchObject({ path: ['provider'], value: 'openai' })
+    expect(plan.map(describeStep)).toEqual([
+      'Add the judge-openai worker',
+      'Store your OpenAI key encrypted on this machine',
+      'Connect Decisions by OpenAI with that key',
+      'Have Judge answer with Decisions by OpenAI',
+      'Check that Decisions by OpenAI answers',
+    ])
+  })
+
   it('sets up the hosted judge with its key behind a reference', () => {
     const jev = JUDGE_OPTIONS[0]
     const plan = judgePlan(
@@ -337,12 +489,24 @@ describe('judgePlan', () => {
       path: ['provider'],
       value: 'typesafe',
     })
+    expect(plan.map(describeStep)).toEqual([
+      'Add 2 workers: judge and judge-typesafe',
+      'Store your TypeSafe key encrypted on this machine',
+      'Connect Jev by TypeSafe with that key',
+      'Have Judge answer with Jev by TypeSafe',
+      'Check that Jev by TypeSafe answers',
+    ])
   })
 
-  it('needs no key for a local judge', () => {
-    const laya = JUDGE_OPTIONS.find((option) => option.id === 'laya')
-    if (!laya) throw new Error('no laya')
-    const plan = judgePlan([{ option: laya }], new Set(['judge']))
+  it.each([
+    ['laya', 'judge-laya'],
+    ['decider', 'judge-decider'],
+    ['clef', 'judge-clef'],
+  ])('needs no key for the local judge %s', (id, worker) => {
+    const local = JUDGE_OPTIONS.find((option) => option.id === id)
+    if (!local) throw new Error(`no ${id}`)
+    expect(local.envVar).toBeUndefined()
+    const plan = judgePlan([{ option: local }], new Set(['judge']))
     expect(plan.map((step) => step.kind)).toEqual([
       'add-workers',
       'set-config',
@@ -350,11 +514,13 @@ describe('judgePlan', () => {
     ])
     const add = plan[0]
     if (add.kind !== 'add-workers') throw new Error('expected add-workers')
-    expect(add.workers).toEqual(['judge-laya'])
+    expect(add.workers).toEqual([worker])
   })
 
   it('adds every checked strategy and makes the first the default', () => {
-    const [jev, laya] = JUDGE_OPTIONS
+    const jev = JUDGE_OPTIONS[0]
+    const laya = JUDGE_OPTIONS.find((option) => option.id === 'laya')
+    if (!laya) throw new Error('no laya')
     const plan = judgePlan(
       [
         { option: jev, key: { mode: 'paste', value: 'ts-key-123456' } },
@@ -370,6 +536,7 @@ describe('judgePlan', () => {
       configuration: 'judge',
       path: ['provider'],
       value: 'typesafe',
+      owner: 'Jev by TypeSafe',
     })
     expect(plan[plan.length - 1]).toMatchObject({
       kind: 'check-judge',
@@ -378,7 +545,10 @@ describe('judgePlan', () => {
   })
 
   it('leaves a running default alone and removes what was unchecked', () => {
-    const [jev, laya, decider] = JUDGE_OPTIONS
+    const jev = JUDGE_OPTIONS[0]
+    const laya = JUDGE_OPTIONS.find((option) => option.id === 'laya')
+    const decider = JUDGE_OPTIONS.find((option) => option.id === 'decider')
+    if (!laya || !decider) throw new Error('no local judges')
     const running = new Set(['judge', 'judge-typesafe', 'judge-laya'])
     // Nothing changed: nothing to run.
     expect(
@@ -464,21 +634,33 @@ describe('judgeFailure', () => {
 })
 
 describe('shouldAutoOpenOnboarding', () => {
-  it('opens by itself only for a person on first run', () => {
-    expect(shouldAutoOpenOnboarding({ status: 'new' }, false)).toBe(true)
+  it('opens on first run, whatever the router serves', () => {
+    // A signed-in Codex or a local llama.cpp server fills the catalog before
+    // setup; the person still sees the wizard once.
+    expect(shouldAutoOpenOnboarding({ status: 'new' }, false, null)).toBe(true)
+    expect(shouldAutoOpenOnboarding({ status: 'new' }, false, 5)).toBe(true)
+  })
+
+  it('opens again after setup only when no model is connected', () => {
+    for (const status of ['completed', 'dismissed', null]) {
+      expect(shouldAutoOpenOnboarding({ status }, false, 0)).toBe(true)
+      expect(shouldAutoOpenOnboarding({ status }, false, 3)).toBe(false)
+      // A router that cannot answer opens nothing.
+      expect(shouldAutoOpenOnboarding({ status }, false, null)).toBe(false)
+    }
+  })
+
+  it('never opens in a browser under automation', () => {
     // An e2e suite, an agent's browser session or a stories render.
-    expect(shouldAutoOpenOnboarding({ status: 'new' }, true)).toBe(false)
-    expect(shouldAutoOpenOnboarding({ status: 'dismissed' }, false)).toBe(false)
-    expect(shouldAutoOpenOnboarding({ status: 'completed' }, false)).toBe(false)
-    expect(shouldAutoOpenOnboarding({ status: null }, false)).toBe(false)
+    expect(shouldAutoOpenOnboarding({ status: 'new' }, true, 0)).toBe(false)
   })
 
   it('stays closed where the ADE turned auto-open off, as a deploy does', () => {
     expect(
-      shouldAutoOpenOnboarding({ status: 'new', auto_open: false }, false),
+      shouldAutoOpenOnboarding({ status: 'new', auto_open: false }, false, 0),
     ).toBe(false)
     expect(
-      shouldAutoOpenOnboarding({ status: 'new', auto_open: true }, false),
+      shouldAutoOpenOnboarding({ status: 'new', auto_open: true }, false, 0),
     ).toBe(true)
   })
 })

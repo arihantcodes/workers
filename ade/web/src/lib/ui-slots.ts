@@ -13,6 +13,7 @@ import type {
   ConfigFormLayout,
   ConfigFormProps,
   FunctionTriggerRenderer,
+  MentionRendererRegistration,
   OverlayRegistration,
   PageRegistration,
   ProviderConfigFormProps,
@@ -82,6 +83,12 @@ export interface RegisteredComposerControl extends ComposerControlRegistration {
 }
 
 export interface RegisteredOverlay extends OverlayRegistration {
+  scope: string
+  path: string
+}
+
+/** Unwrapped: the preview card scopes it and falls back to the generic card. */
+export interface RegisteredMentionRenderer extends MentionRendererRegistration {
   scope: string
   path: string
 }
@@ -159,6 +166,7 @@ const sessionTurnSummariesStore = createStore<RegisteredSessionTurnSummary>()
 const composerActionsStore = createStore<RegisteredComposerAction>()
 const composerControlsStore = createStore<RegisteredComposerControl>()
 const overlaysStore = createStore<RegisteredOverlay>()
+const mentionRenderersStore = createStore<RegisteredMentionRenderer>()
 const uiAssetsStatusStore = createValueStore<UiAssetsStatus>('unavailable')
 
 /**
@@ -291,21 +299,28 @@ export function registerExtOverlay(entry: RegisteredOverlay): () => void {
   return overlaysStore.add(entry)
 }
 
+/** Duplicate provider: last registration wins in lookups. */
+export function registerExtMentionRenderer(
+  entry: RegisteredMentionRenderer,
+): () => void {
+  const duplicate = mentionRenderersStore
+    .get()
+    .find((renderer) => renderer.provider === entry.provider)
+  if (duplicate && duplicate.path !== entry.path) {
+    console.warn(
+      `[iii-ui] duplicate mention renderer for '@${entry.provider}' - ` +
+        `'${entry.path}' overrides '${duplicate.path}'`,
+    )
+  }
+  return mentionRenderersStore.add(entry)
+}
+
 export function getExtPages(): readonly RegisteredPage[] {
   return pagesStore.get()
 }
 
 export function getExtTriggerActivityRenderers(): readonly RegisteredTriggerActivityRenderer[] {
   return triggerActivityRenderersStore.get()
-}
-
-/** Last registration wins for duplicate ids. */
-export function getExtPage(id: string): RegisteredPage | undefined {
-  const pages = pagesStore.get()
-  for (let i = pages.length - 1; i >= 0; i--) {
-    if (pages[i].id === id) return pages[i]
-  }
-  return undefined
 }
 
 /**
@@ -326,6 +341,15 @@ export function whenExtPage(id: string, timeoutMs: number): Promise<boolean> {
     })
     const timer = setTimeout(() => finish(false), timeoutMs)
   })
+}
+
+/** Last registration wins for duplicate ids. */
+export function getExtPage(id: string): RegisteredPage | undefined {
+  const pages = pagesStore.get()
+  for (let i = pages.length - 1; i >= 0; i--) {
+    if (pages[i].id === id) return pages[i]
+  }
+  return undefined
 }
 
 function dedupeOverlays(
@@ -392,6 +416,23 @@ export function isExtConfigFormPending(
 }
 
 const EMPTY: readonly never[] = []
+
+/** The renderer a worker registered for `@<provider>` (the latest wins). */
+export function useExtMentionRenderer(
+  provider: string,
+): RegisteredMentionRenderer | undefined {
+  const renderers = useSyncExternalStore(
+    mentionRenderersStore.subscribe,
+    mentionRenderersStore.get,
+    () => EMPTY,
+  )
+  return useMemo(() => {
+    for (let i = renderers.length - 1; i >= 0; i--) {
+      if (renderers[i].provider === provider) return renderers[i]
+    }
+    return undefined
+  }, [renderers, provider])
+}
 
 export function useExtPages(): readonly RegisteredPage[] {
   return useSyncExternalStore(pagesStore.subscribe, pagesStore.get, () => EMPTY)

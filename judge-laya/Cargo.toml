@@ -2,7 +2,7 @@
 
 [package]
 name = "judge-laya"
-version = "0.2.2"
+version = "0.2.5"
 edition = "2021"
 publish = false
 license = "Apache-2.0"
@@ -14,6 +14,7 @@ console-ui = ["dep:iii-console-ui"]
 
 [dependencies]
 judge-contract = { path = "../crates/judge-contract" }
+judge-provider = { path = "../crates/judge-provider" }
 iii-sdk = "=0.23.0"
 iii-config-client = { path = "../crates/config-client" }
 iii-console-ui = { path = "../crates/console-ui", optional = true }
@@ -28,6 +29,10 @@ safetensors = "0.8"
 iii-llama-runtime = { path = "../crates/llama-runtime" }
 iii-llama-native = { path = "../crates/llama-native" }
 tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
+# lang.rs: Python's character classes (general categories) and
+# `unicodedata.combining`; tokenizers and hf-hub's idna lock them already.
+regex = "1"
+icu_properties = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 anyhow = "1"

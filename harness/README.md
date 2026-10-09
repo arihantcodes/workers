@@ -112,7 +112,7 @@ the only contract.
 - `engine::triggers::list` / `engine::triggers::info { id }` — legal trigger types and their config schemas
 - `engine::registered-triggers::list` — every trigger instance already bound
 
-**2. Call a function.** Use `agent_trigger` with `{ function: "<worker>::<fn>", description: "<short user-facing action>", payload: { ... } }`. The description is shown as the agent's activity in chat; keep it concise and in the user's language. The payload is a JSON object (never a stringified one), and you fetch the contract via `engine::functions::info` before the first call.
+**2. Call a function.** Use `agent_trigger` with `{ function: "<worker>::<fn>", description: "<short user-facing action>", payload: { ... } }`. The description is shown as the agent's activity in chat; keep it concise and in the session's response language (named in the runtime context, detected from the user's first message). The payload is a JSON object (never a stringified one), and you fetch the contract via `engine::functions::info` before the first call.
 
 **3. Need a capability that is not registered?**
 - `directory::registry::workers::list { search: "<capability>" }`
@@ -299,6 +299,15 @@ omitted field never silently resets the effort (which would also bust the
 provider's messages cache). Naming either field replaces the pair —
 `provider_options: {}` resets to the provider default.
 
+`options.reasoning: "lowest"` asks the harness to choose the effort instead:
+the first entry other than `none` in the model's `reasoning_efforts`, else
+`minimal` for a model that only reports `supports_thinking`, else no effort
+(the provider decides). It cannot be combined with `thinking_level` or
+`provider_options`, fails the send when the router has no catalog row for
+the model, and the send response reports the choice as `reasoning`
+(`thinking_level` and the native `reasoning_effort`). Later sends inherit it
+like any explicit effort.
+
 The prompt reaches `router::chat` in two forms: the flat `system_prompt`,
 and `system_sections` — the STABLE prefix (the frozen profile or identity
 prompt plus the frozen skills index, `cache_boundary: true`) followed by the
@@ -325,7 +334,7 @@ turn: the profile's RESOLVED system prompt — the directory composes `extends`
 chains root-first, so `tech-lead` extending the bundled `iii` base arrives as
 the full iii doctrine followed by the tech-lead body — IS the session
 identity. Nothing built-in sits underneath it and no prefix is added; the
-usual per-step runtime context (session id, working directory, policy aid,
+usual per-step runtime context (session id, working directory, response language, policy aid,
 skills index, hook injections) follows it. A profile whose `extends` chain does not resolve is refused as an
 invalid request with the directory's D415 text. The profile's `skills` are
 PRELOADED: each id's body is fetched once from `directory::skills::get` and

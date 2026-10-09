@@ -69,6 +69,7 @@ import { ChatFileNavigation, openChatFile } from '@/lib/file-navigation'
 import { createWorkspaceFileSearch } from '@/lib/file-search'
 import { formatStopReason } from '@/lib/format-stop-reason'
 import { getIiiClient } from '@/lib/iii-client'
+import { useMentionProviderRefresh } from '@/lib/mentions/providers'
 import {
   onboardingWizardAvailable,
   requestOnboardingWizard,
@@ -332,6 +333,19 @@ export function ChatView({
         : undefined,
     [workingDirEnabled, conversationWorkingDir],
   )
+  // Worker mention searches (`@kanban:…`) learn which chat and folder they
+  // were asked from; a provider may rank by it or leave the asking session out.
+  const mentionContext = useMemo(
+    () => ({
+      session_id: conversation.id,
+      ...(conversationWorkingDir
+        ? { working_dir: conversationWorkingDir }
+        : {}),
+    }),
+    [conversation.id, conversationWorkingDir],
+  )
+  // A worker that joins (or leaves) brings (or takes) its `@name` with it.
+  useMentionProviderRefresh(backend.id === 'real')
   // A clicked file pill opens the shell explorer on that file — on the
   // referenced lines when the mention carries a window. Relative mentions
   // resolve against the session's folder; absolute ones (a file referenced
@@ -2109,6 +2123,11 @@ export function ChatView({
             case 'turn-status': {
               // `queued` renders in the queued-messages strip, not the waiting indicator.
               setTurnPhase(event.phase === 'queued' ? null : event.phase)
+              // The harness resolved a `lowest` request: show what it chose,
+              // and later turns send it like any picked effort.
+              if (event.reasoningEffort) {
+                handleThinkingLevelChange(event.reasoningEffort)
+              }
               break
             }
             case 'stop-reason': {
@@ -2220,6 +2239,7 @@ export function ChatView({
       conversation.workingDir,
       effectiveModel,
       thinkingLevel,
+      handleThinkingLevelChange,
       effectiveSystemPrompt,
       sessionId,
       contextWindow,
@@ -3024,6 +3044,7 @@ export function ChatView({
               }
               functionEntries={functionEntries}
               searchFiles={searchFiles}
+              mentionContext={mentionContext}
               onOpenFileMention={
                 workingDirEnabled ? handleOpenFileMention : undefined
               }

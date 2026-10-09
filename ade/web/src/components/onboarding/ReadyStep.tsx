@@ -10,6 +10,7 @@ import { DEFAULT_AGENT_ID } from '@/components/chat/agent-defaults'
 import { Skeleton } from '@/components/ui/Skeleton'
 import { Wordmark } from '@/components/ui/Wordmark'
 import type { JudgeOption } from '@/lib/onboarding/catalog'
+import { servesUsableModels } from '@/lib/onboarding/plan'
 import type { ExamplePrompt } from '@/lib/onboarding/prompts'
 import { Button } from './controls'
 import { ProviderMark } from './ProviderMark'
@@ -63,9 +64,7 @@ export function ReadyStep({
 }) {
   const { snapshot, activity } = onboarding
   const ids = useId()
-  const connected = (snapshot.providers ?? []).filter(
-    (provider) => provider.modelCount > 0,
-  )
+  const connected = (snapshot.providers ?? []).filter(servesUsableModels)
   const totalModels = connected.reduce(
     (sum, provider) => sum + provider.modelCount,
     0,
@@ -77,12 +76,24 @@ export function ReadyStep({
         .flatMap((entry) => entry.workers ?? []),
     ),
   ]
+  // Chromium this setup downloaded for the browser worker.
+  const chromium = activity.some(
+    (entry) => entry.group === 'browser' && entry.status === 'done',
+  )
   const lines: { title: string; detail?: string; providerId?: string }[] = [
     ...connected.map((provider) => ({
       title: `${provider.title} connected`,
       providerId: provider.id,
-      detail: `${provider.modelCount} ${provider.modelCount === 1 ? 'model' : 'models'}${provider.credentialRef ? ` · key at ${provider.credentialRef}` : ''}`,
+      detail: `${provider.modelCount} ${provider.modelCount === 1 ? 'model' : 'models'}`,
     })),
+    ...(chromium
+      ? [
+          {
+            title: 'Chromium is ready for agents',
+            detail: 'they open and check the pages they build',
+          },
+        ]
+      : []),
     ...(judges.length > 0
       ? [
           {

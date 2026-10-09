@@ -12,6 +12,7 @@ use iii_sdk::{IIIClient, RegisterFunction};
 use llm_router::provider_scaffold::aborts::{make_abort, StreamAborts};
 use llm_router::provider_scaffold::cache::ScaffoldCache;
 use llm_router::provider_scaffold::registration::typed_async_with_bad_request;
+use llm_router::types::model::ThinkingLevel;
 use llm_router::types::router::{
     ProviderDeclaration, ProviderDefaults, ProviderReadyAck, RouterReadyEvent,
 };
@@ -37,6 +38,22 @@ pub fn declaration() -> ProviderDeclaration {
         // registration and periodically while the worker is running; a curated
         // fallback covers an OAuth-rejected models endpoint.
         supports_model_listing: Some(true),
+        // Starting point for callers that name no model. The router ranks
+        // by variant in this order (Sonnet, then Opus, then Fable, then
+        // Haiku), then the newest version within the variant.
+        default_models: Some(vec![
+            "claude-code/claude-sonnet-5-5".into(),
+            "claude-code/claude-sonnet-5".into(),
+            "claude-code/claude-sonnet-4-6".into(),
+            "claude-code/claude-opus-5-5".into(),
+            "claude-code/claude-opus-5".into(),
+            "claude-code/claude-fable-5-1".into(),
+            "claude-code/claude-haiku-5-5".into(),
+            "claude-code/claude-haiku-4-5".into(),
+        ]),
+        default_thinking_level: Some(ThinkingLevel::Minimal),
+        context_overflow_hint: None,
+        credential_optional: None,
         models: None,
         // Self-reported; availability mapping only, never authorization.
         worker_id: Some("provider-claude-code".into()),

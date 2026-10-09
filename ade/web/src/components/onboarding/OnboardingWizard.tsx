@@ -26,12 +26,14 @@ import {
   saveOnboardingState,
 } from '@/lib/onboarding/api'
 import { type JudgeOption, TOUR_PAGE } from '@/lib/onboarding/catalog'
+import { chromiumMissing } from '@/lib/onboarding/chromium'
 import {
   browserIsAutomated,
   onOnboardingWizardRequest,
   shouldAutoOpenOnboarding,
   type WizardStepId,
 } from '@/lib/onboarding/open'
+import { servesUsableModels } from '@/lib/onboarding/plan'
 import {
   type ExamplePrompt,
   fetchExamplePrompts,
@@ -39,9 +41,11 @@ import {
 import { prepareTour } from '@/lib/onboarding/tour'
 import { requestPanelOpen } from '@/lib/panel-context'
 import { cn } from '@/lib/utils'
+import { BrowserStep } from './BrowserStep'
 import { openExamplePrompt } from './example-prompt'
 import { JudgeStep } from './JudgeStep'
 import { ModelsStep } from './ModelsStep'
+import type { StepPosition } from './parts'
 import { ReadyStep, type TourState } from './ReadyStep'
 import { Stepper, type StepperStep } from './Stepper'
 import { connectedModelCount, useOnboarding } from './use-onboarding'
@@ -50,6 +54,13 @@ import { WelcomeStep } from './WelcomeStep'
 const STEPS: readonly StepperStep[] = [
   { id: 'welcome', title: 'Welcome', description: 'What the ADE does' },
   { id: 'models', title: 'Models', description: 'Connect a provider' },
+  // Listed only while it has something to do (see `showBrowser`).
+  {
+    id: 'browser',
+    title: 'Browser',
+    description: 'Chromium for agents',
+    optional: true,
+  },
   {
     id: 'judge',
     title: 'Judge',
@@ -58,6 +69,18 @@ const STEPS: readonly StepperStep[] = [
   },
   { id: 'ready', title: 'Ready', description: 'Start building' },
 ]
+
+/** "Step N of M" counts the steps that set something up. */
+export function stepPosition(
+  steps: readonly { id: WizardStepId }[],
+  id: WizardStepId,
+): StepPosition | undefined {
+  const setup = steps.filter(
+    (entry) => entry.id !== 'welcome' && entry.id !== 'ready',
+  )
+  const index = setup.findIndex((entry) => entry.id === id)
+  return index < 0 ? undefined : { index: index + 1, total: setup.length }
+}
 
 /**
  * The first-run setup wizard. Mounted once in `App`: it opens by itself the
@@ -99,6 +122,16 @@ export function OnboardingWizardHost() {
     void refreshModels?.()
   })
   const busy = onboarding.running !== null || tour.kind === 'preparing'
+  // The Browser step joins the list when the project runs the browser worker
+  // and the machine has no Chromium for it (or someone asks for it), and
+  // stays listed once shown.
+  const needsBrowser = chromiumMissing(onboarding.snapshot.browser)
+  const [browserListed, setBrowserListed] = useState(false)
+  useEffect(() => {
+    if (needsBrowser) setBrowserListed(true)
+  }, [needsBrowser])
+  const showBrowser = browserListed || needsBrowser || step === 'browser'
+  const steps = STEPS.filter((entry) => entry.id !== 'browser' || showBrowser)
 
   useEffect(() => {
     if (!live) return
@@ -111,12 +144,18 @@ export function OnboardingWizardHost() {
         if (state.status === 'completed') {
           setVisited(new Set(STEPS.map((entry) => entry.id)))
         }
-        if (!shouldAutoOpenOnboarding(state, browserIsAutomated())) return
-        // Models already connected — a deploy with keys in its environment —
-        // mean a project that is set up. A router that cannot answer opens
-        // nothing either: the wizard could not connect a model through it.
-        const models = await connectedModelCount().catch(() => null)
-        if (!cancelled && models === 0) setOpen(true)
+        // First run opens whatever the router serves; after setup, only a
+        // project with no model connected opens it again.
+        const models =
+          state.status === 'new'
+            ? null
+            : await connectedModelCount().catch(() => null)
+        if (
+          !cancelled &&
+          shouldAutoOpenOnboarding(state, browserIsAutomated(), models)
+        ) {
+          setOpen(true)
+        }
       })
       .catch(() => undefined)
     return () => {
@@ -128,6 +167,7 @@ export function OnboardingWizardHost() {
     () =>
       onOnboardingWizardRequest((target) => {
         const next = target ?? 'welcome'
+        if (next === 'browser') setBrowserListed(true)
         setStep(next)
         setVisited((current) => new Set([...current, next]))
         setOpen(true)
@@ -136,6 +176,7 @@ export function OnboardingWizardHost() {
   )
 
   const go = useCallback((next: WizardStepId) => {
+    if (next === 'browser') setBrowserListed(true)
     setStep(next)
     setVisited((current) => new Set([...current, next]))
   }, [])
@@ -159,7 +200,7 @@ export function OnboardingWizardHost() {
       setJudges(judgeChoices)
       go('ready')
       const providers = (onboarding.snapshot.providers ?? [])
-        .filter((provider) => provider.modelCount > 0)
+        .filter(servesUsableModels)
         .map((provider) => ({
           id: provider.id,
           models: provider.modelCount,
@@ -172,14 +213,26 @@ export function OnboardingWizardHost() {
             .flatMap((entry) => entry.workers ?? []),
         ),
       ]
+      const chromiumInstalled = onboarding.activity.some(
+        (entry) => entry.group === 'browser' && entry.status === 'done',
+      )
       record('completed', {
         providers,
         judge: judgeChoices[0]?.id ?? null,
         judges: judgeChoices.map((option) => option.id),
         workers_added: workers,
+        chromium_installed: chromiumInstalled
+          ? (onboarding.snapshot.browser?.version ?? true)
+          : false,
       })
     },
-    [go, onboarding.activity, onboarding.snapshot.providers, record],
+    [
+      go,
+      onboarding.activity,
+      onboarding.snapshot.browser,
+      onboarding.snapshot.providers,
+      record,
+    ],
   )
 
   const start = useCallback(() => {
@@ -319,7 +372,7 @@ export function OnboardingWizardHost() {
               </div>
               <Stepper
                 orientation="vertical"
-                steps={STEPS}
+                steps={steps}
                 current={step}
                 reachable={reachable}
                 onSelect={go}
@@ -338,7 +391,7 @@ export function OnboardingWizardHost() {
                   <CloseButton className="ml-auto" />
                 </div>
                 <Stepper
-                  steps={STEPS}
+                  steps={steps}
                   current={step}
                   reachable={reachable}
                   onSelect={go}
@@ -366,12 +419,19 @@ export function OnboardingWizardHost() {
                   <ModelsStep
                     onboarding={onboarding}
                     onBack={() => go('welcome')}
+                    onNext={() => go(showBrowser ? 'browser' : 'judge')}
+                  />
+                ) : step === 'browser' ? (
+                  <BrowserStep
+                    onboarding={onboarding}
+                    position={stepPosition(steps, 'browser')}
+                    onBack={() => go('models')}
                     onNext={() => go('judge')}
                   />
                 ) : step === 'judge' ? (
                   <JudgeStep
                     onboarding={onboarding}
-                    onBack={() => go('models')}
+                    onBack={() => go(showBrowser ? 'browser' : 'models')}
                     onNext={finishTo}
                   />
                 ) : (

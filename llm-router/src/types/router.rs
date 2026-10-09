@@ -136,6 +136,25 @@ pub struct ProviderInfo {
     /// when the provider declared none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub icon_svg: Option<String>,
+    /// The model a consumer should start with when nothing else names one:
+    /// the newest model of the best-ranked variant its declared
+    /// `default_models` name (Terra, Sol, Astra, Luna for GPT providers;
+    /// Sonnet, Opus, Fable, Haiku for Claude providers), else the first declared id
+    /// in its catalog slice, else the closest same-family model, else absent
+    /// (see
+    /// `registry::availability::resolve_default_model`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_model: Option<String>,
+    /// The thinking level a consumer should start with when nothing else
+    /// names one; copied from the declaration. Absent means omit the level
+    /// and let the provider apply its own default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_thinking_level: Option<ThinkingLevel>,
+    /// Provider-specific guidance a console appends to a context-overflow
+    /// failure on one of this provider's models; copied from the
+    /// declaration. Absent when the provider declared none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_overflow_hint: Option<String>,
     /// Where the credential comes from and why it is unusable, if it is.
     #[serde(flatten)]
     pub credential: CredentialStatus,
@@ -189,6 +208,30 @@ pub struct ProviderDeclaration {
     /// the router drops anything larger or not starting with `<svg`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub icon_svg: Option<String>,
+    /// Chat model ids the provider recommends as a starting point. The order
+    /// in which the list first names each variant sets the variant rank.
+    /// `router::provider::list` reports the newest catalog model of the
+    /// best-ranked variant as `default_model` (see
+    /// `registry::availability::resolve_default_model`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_models: Option<Vec<String>>,
+    /// The thinking level to use with the default model when a caller names
+    /// none. Absent means omit the level.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_thinking_level: Option<ThinkingLevel>,
+    /// Guidance a console shows under a context-overflow failure on one of
+    /// this provider's models, for causes the console cannot fix by
+    /// compacting (a self-hosted server started with a small window, say).
+    /// One or two plain sentences, optionally with a link to the provider's
+    /// docs. `router::provider::list` carries it verbatim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_overflow_hint: Option<String>,
+    /// `true` when the provider works without a credential (a local server
+    /// started without a key): the router then reports it `configured` with
+    /// no key. A key that is set is still resolved and sent. Absent means a
+    /// key is required.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_optional: Option<bool>,
 }
 
 /// Upper bound the router accepts for [`ProviderDeclaration::icon_svg`].
@@ -557,17 +600,17 @@ pub struct ConfigChangedEvent {
     pub id: Option<String>,
 }
 
-/// Advisory function-registry change event delivered to
-/// `router::on_functions_changed`. The handler ignores event values and
+/// Advisory `engine::functions-available` event delivered to
+/// `router::on_functions_changed`. The engine sends
+/// `{ event: "functions_changed", functions: [...] }` with the full current
+/// function list; it does not say which worker or function changed. The
+/// handler ignores event values (the `functions` list is not deserialized) and
 /// re-fetches the authoritative registry before nudging live providers.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct FunctionsChangedEvent {
-    /// Engine event tag (advisory).
+    /// Engine event tag, `"functions_changed"` (advisory).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub event: Option<String>,
-    /// Worker whose registered functions changed (advisory).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub worker_id: Option<String>,
 }
 
 /// Advisory `secrets::changed` event delivered to `router::on_secret_changed`.

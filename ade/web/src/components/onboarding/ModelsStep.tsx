@@ -1,6 +1,7 @@
 import { LoaderCircle } from 'lucide-react'
 import type * as React from 'react'
 import { useEffect, useId, useMemo, useState } from 'react'
+import { DeviceSignIn } from '@/components/chat/DeviceSignIn'
 import { Skeleton } from '@/components/ui/Skeleton'
 import { KEY_PROVIDERS, SUBSCRIPTION_PROVIDERS } from '@/lib/onboarding/catalog'
 import {
@@ -84,14 +85,8 @@ export function ModelsStep({
     [snapshot.tools, snapshot.providers, snapshot.detections],
   )
   const extra = useMemo(
-    () =>
-      registryChoices(
-        registry,
-        snapshot.installed,
-        choices,
-        snapshot.providers ?? [],
-      ),
-    [registry, snapshot.installed, choices, snapshot.providers],
+    () => registryChoices(registry, snapshot.installed, choices),
+    [registry, snapshot.installed, choices],
   )
   const subscriptions = useMemo(
     () =>
@@ -102,18 +97,33 @@ export function ModelsStep({
     () => catalogOrder(choices.filter((choice) => choice.kind === 'key')),
     [choices],
   )
-  const all = [...subscriptions, ...keyed, ...extra]
+  // Providers that sign in from here (GitHub Copilot), and any other running
+  // provider the router already serves models from.
+  const devices = useMemo(
+    () => choices.filter((choice) => choice.kind === 'device'),
+    [choices],
+  )
+  const connectedOthers = useMemo(
+    () => choices.filter((choice) => choice.kind === 'registry'),
+    [choices],
+  )
+  const all = [
+    ...subscriptions,
+    ...keyed,
+    ...devices,
+    ...connectedOthers,
+    ...extra,
+  ]
 
-  // Connected and recommended choices start checked; the user's clicks win.
-  const draftFor = (choice: ProviderChoice): Draft => {
-    const draft = drafts.get(choice.providerId)
-    if (draft) return draft
-    return {
-      selected: choice.ready || (choice.recommended && usable(choice)),
+  // Connected choices start checked, and recommended ones until the first
+  // provider is connected; the user's own clicks win after.
+  const nothingConnected = !choices.some((choice) => choice.ready)
+  const draftFor = (choice: ProviderChoice): Draft =>
+    resolveDraft(drafts.get(choice.providerId), {
+      selected: choice.ready || preselected(choice, nothingConnected),
       key:
         choice.kind === 'key' ? defaultKeyInput(choice.detection) : undefined,
-    }
-  }
+    })
   const update = (choice: ProviderChoice, next: Partial<Draft>) =>
     setDrafts((current) =>
       new Map(current).set(choice.providerId, { ...draftFor(choice), ...next }),
@@ -151,7 +161,7 @@ export function ModelsStep({
   }[]
 
   const apply = async () => {
-    if (await run('models', plan)) setDrafts(new Map())
+    if (await run('models', plan)) setDrafts(draftsAfterConnect(drafts))
   }
 
   const renderTile = (choice: ProviderChoice) => (
@@ -253,6 +263,36 @@ export function ModelsStep({
             </Rows>
           </Section>
 
+          {devices.length > 0 ? (
+            <Section
+              title="Sign in from here"
+              hint="uses your plan, no API key"
+            >
+              <Rows>
+                {devices.map((choice) =>
+                  choice.kind === 'device' ? (
+                    <DeviceRow
+                      key={choice.providerId}
+                      choice={choice}
+                      selected={draftFor(choice).selected}
+                      disabled={busy}
+                      onToggle={(selected) => update(choice, { selected })}
+                      onConnected={() =>
+                        void run('models', [
+                          {
+                            kind: 'wait-models',
+                            providerId: choice.providerId,
+                            title: choice.title,
+                          },
+                        ])
+                      }
+                    />
+                  ) : null,
+                )}
+              </Rows>
+            </Section>
+          ) : null}
+
           <Section
             title="API keys"
             hint={
@@ -262,7 +302,7 @@ export function ModelsStep({
             }
           >
             <div className="grid gap-2 @sm:grid-cols-2">
-              {keyed.map(renderTile)}
+              {[...keyed, ...connectedOthers].map(renderTile)}
             </div>
             {needsKey.map(({ choice, key }) => (
               <div
@@ -309,6 +349,111 @@ export function ModelsStep({
 
       <EngineLog plan={plan} entries={log} running={running === 'models'} />
     </StepLayout>
+  )
+}
+
+/**
+ * After Connect: every checkbox stays as the person left it — a recommended
+ * choice they unchecked must not come back checked — and typed keys are
+ * dropped so a key is not kept in memory once stored.
+ */
+export function draftsAfterConnect(
+  drafts: ReadonlyMap<string, Draft>,
+): ReadonlyMap<string, Draft> {
+  return new Map(
+    [...drafts].map(([id, draft]) => [id, { selected: draft.selected }]),
+  )
+}
+
+/** The person's draft over the default; a dropped key falls back to it. */
+export function resolveDraft(draft: Draft | undefined, fallback: Draft): Draft {
+  if (!draft) return fallback
+  return { ...draft, key: draft.key ?? fallback.key }
+}
+
+/**
+ * Whether a choice starts checked. Recommendations are a starting point for
+ * the first connection only: once a provider is connected, coming back to
+ * this step (Back, or reopening setup) never re-checks the ones the person
+ * left out.
+ */
+export function preselected(
+  choice: ProviderChoice,
+  nothingConnected: boolean,
+): boolean {
+  return (
+    nothingConnected && choice.recommended && !choice.ready && usable(choice)
+  )
+}
+
+/**
+ * A provider that signs in from here with a device code (GitHub Copilot):
+ * the sign-in stands where the checkbox goes until it lands.
+ */
+function DeviceRow({
+  choice,
+  selected,
+  disabled,
+  onToggle,
+  onConnected,
+}: {
+  choice: Extract<ProviderChoice, { kind: 'device' }>
+  selected: boolean
+  disabled: boolean
+  onToggle: (selected: boolean) => void
+  onConnected: () => void
+}) {
+  const id = useId()
+  return (
+    <div
+      className={cn(
+        'flex flex-col gap-1 px-3.5 py-2.5 transition-colors duration-150 ease-[var(--motion-ease-standard)]',
+        selected && choice.ready && 'bg-neutral-100 dark:bg-neutral-900',
+      )}
+    >
+      <div className="flex items-start gap-3">
+        <ProviderMark
+          id={choice.providerId}
+          label={choice.title}
+          className="mt-0.5 size-4 shrink-0 text-ink"
+        />
+        <label
+          htmlFor={id}
+          className={cn(
+            'flex min-w-0 flex-1 flex-col gap-px',
+            !disabled && choice.ready && 'cursor-pointer',
+          )}
+        >
+          <span className="font-sans text-[13px] font-medium leading-5 text-ink">
+            {choice.title}
+          </span>
+          <span className="text-pretty font-sans text-[13px] leading-5 text-neutral-600 dark:text-neutral-400">
+            {choice.reason}
+          </span>
+        </label>
+        <span className="flex h-5 items-center gap-3">
+          <ChoiceStatus choice={choice} selected={selected} />
+          {choice.ready ? (
+            <Checkbox
+              id={id}
+              aria-label={`Connect ${choice.title}`}
+              checked={selected}
+              disabled={disabled}
+              onChange={(event) => onToggle(event.currentTarget.checked)}
+            />
+          ) : null}
+        </span>
+      </div>
+      {choice.ready ? null : (
+        <div className="pl-7">
+          <DeviceSignIn
+            provider={choice.provider}
+            installed={choice.installed}
+            onConnected={onConnected}
+          />
+        </div>
+      )}
+    </div>
   )
 }
 

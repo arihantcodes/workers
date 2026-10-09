@@ -207,7 +207,7 @@ pub fn resolve_provider_config(
 
     ProviderResolveOutput {
         resolved: ProviderResolveResponse {
-            configured: credential.is_some(),
+            configured: credential.is_some() || declaration.credential_optional == Some(true),
             source,
             credential,
             api_url,
@@ -316,6 +316,10 @@ mod tests {
             models: None,
             worker_id: None,
             icon_svg: None,
+            default_models: None,
+            default_thinking_level: None,
+            context_overflow_hint: None,
+            credential_optional: None,
         }
     }
 
@@ -376,6 +380,29 @@ mod tests {
         assert_eq!(out.resolved.source, CredentialSource::None);
         assert_eq!(out.status.credential_source, Some(CredentialOrigin::None));
         assert!(fake.calls().is_empty(), "no reference, no secrets call");
+    }
+
+    #[tokio::test]
+    async fn a_provider_whose_key_is_optional_is_configured_without_one() {
+        // A local llama.cpp server runs without --api-key: nothing to resolve,
+        // and its models are still usable.
+        let fake = FakeSecrets::default();
+        let config = config(json!({}));
+        let secrets = fake.cache();
+        let mut optional = declaration(None);
+        optional.credential_optional = Some(true);
+        let out = resolve_provider_config(&config, &optional, &secrets);
+        assert!(out.resolved.configured);
+        assert!(out.resolved.credential.is_none());
+        assert_eq!(out.resolved.source, CredentialSource::None);
+
+        // Declared but not optional, or absent: still unconfigured.
+        for flag in [Some(false), None] {
+            let mut required = declaration(None);
+            required.credential_optional = flag;
+            let out = resolve_provider_config(&config, &required, &secrets);
+            assert!(!out.resolved.configured, "{flag:?}");
+        }
     }
 
     #[tokio::test]

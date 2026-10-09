@@ -4,6 +4,7 @@ import {
   useCallback,
   useContext,
   useEffect,
+  useMemo,
   useRef,
   useState,
 } from 'react'
@@ -37,8 +38,10 @@ import { getDefaultBackend } from '@/lib/backend'
 import { hasWorkingConversation } from '@/lib/chat-activity'
 import { requestComposerFocus } from '@/lib/composer-insert'
 import type { IiiClient } from '@/lib/iii-client'
+import { setMentionSessionOpener } from '@/lib/mentions/open-session'
 import {
   type ProviderListEntry,
+  preferredStartingModel,
   refreshProviderModels,
 } from '@/lib/models-catalog'
 import { type ConversationAdapter, startUiLoader } from '@/lib/ui-loader'
@@ -164,10 +167,15 @@ export function ConversationsProvider({
   const sessionManagerAvailable = isSessionManagerAvailable(
     useSessionManagerStatus(backend.id === 'real'),
   )
+  const preferredModel = useMemo(
+    () => preferredStartingModel(presentProviders, new Set(catalogKeys)),
+    [presentProviders, catalogKeys],
+  )
   const api = useConversations(
     catalogKeys,
     !catalogLoading,
     backend.id === 'real' && sessionManagerAvailable,
+    preferredModel,
   )
 
   // Hoisted above workspace routes: switching panels must not release a
@@ -270,6 +278,8 @@ export function ConversationsProvider({
   const openConversation = useCallback((sessionId: string) => {
     conversationAdapterRef.current?.selectConversation(sessionId)
   }, [])
+  // A `@session(id=…)` pill anywhere in the tab opens its chat through this.
+  useEffect(() => setMentionSessionOpener(openConversation), [openConversation])
 
   const value: ConversationsContextValue = {
     ...api,

@@ -17,23 +17,38 @@ import {
   SUBSCRIPTION_PROVIDERS,
 } from '@/lib/onboarding/catalog'
 import {
+  BROWSER_WORKER,
+  type ChromiumInstallOutcome,
+  type ChromiumInstallProgress,
+  type ChromiumState,
+  chromiumMissing,
+  describeProgress,
+  followChromiumInstall,
+  progressFraction,
+  readChromiumState,
+  setChromiumMissing,
+} from '@/lib/onboarding/chromium'
+import {
   describeStep,
   type KeyDetection,
   type PlanStep,
   type ProviderState,
+  servesUsableModels,
+  stepDetail,
   type ToolScan,
 } from '@/lib/onboarding/plan'
 import { envFileName, getSecretsStatus } from '@/lib/secrets'
 
 /** Which part of setup an action belongs to; each step shows its own. */
-export type ActivityGroup = 'models' | 'judge'
+export type ActivityGroup = 'models' | 'browser' | 'judge'
 
 export interface ActivityEntry {
   id: number
   group: ActivityGroup
+  /** One plain sentence (`describeStep`). */
   title: string
-  /** The engine operation behind it, shown in mono. */
-  detail: string
+  /** The engine operation behind it (`stepDetail`), shown in mono. */
+  detail?: string
   status: 'running' | 'done' | 'failed'
   /** Live progress line while running; the outcome once finished. */
   note?: string
@@ -55,9 +70,15 @@ export interface MachineSnapshot {
   /** The secrets worker's env file, by name (`.env` unless configured). */
   envFile: string
   installed: ReadonlySet<string>
-  consoleConfig: Record<string, unknown> | null
-  /** The judge hub's default strategy id, when the hub is running. */
+  /** The judge hub's `provider`, `null` when Judge is not set up or unread. */
   judgeProvider: string | null
+  consoleConfig: Record<string, unknown> | null
+  /**
+   * Chromium where the browser worker runs; `null` when no browser worker
+   * is installed, or it was not read yet.
+   */
+  browser: ChromiumState | null
+  browserError: string | null
 }
 
 const EMPTY: MachineSnapshot = {
@@ -68,8 +89,10 @@ const EMPTY: MachineSnapshot = {
   detections: null,
   envFile: envFileName(null),
   installed: new Set(),
-  consoleConfig: null,
   judgeProvider: null,
+  consoleConfig: null,
+  browser: null,
+  browserError: null,
 }
 
 const PROVIDER_WORKERS = new Map(
@@ -100,18 +123,19 @@ export function withWorkerPresence(
 
 /**
  * Chat models the router serves right now from providers whose worker is
- * connected — the wizard's own reading. Throws when the router or the
- * engine cannot answer.
+ * connected and whose models are usable (`servesUsableModels`) — the
+ * wizard's own reading. An unconfigured key provider can still list models,
+ * but the picker cannot use them, so they do not count. Throws when the
+ * router or the engine cannot answer.
  */
 export async function connectedModelCount(): Promise<number> {
   const [providers, installed] = await Promise.all([
     readProviderStates(),
     installedWorkerNames(),
   ])
-  return withWorkerPresence(providers, installed).reduce(
-    (sum, provider) => sum + provider.modelCount,
-    0,
-  )
+  return withWorkerPresence(providers, installed)
+    .filter(servesUsableModels)
+    .reduce((sum, provider) => sum + provider.modelCount, 0)
 }
 
 /** Every env var the wizard can reuse: provider keys and the hosted judge's. */
@@ -158,18 +182,19 @@ export function useOnboarding(
       readConsoleConfig(),
     ])
     const names = installed.value ?? new Set<string>()
-    const [[detections, secrets], judgeProvider] = await Promise.all([
+    const [detections, secrets, browser, judgeProvider] = await Promise.all([
       names.has(SECRETS_WORKER)
-        ? Promise.all([
-            settle(detectKeys(DETECTED_KEY_NAMES)),
-            settle(getSecretsStatus()),
-          ])
-        : ([
-            { value: null, error: null },
-            { value: undefined, error: null },
-          ] as const),
+        ? settle(detectKeys(DETECTED_KEY_NAMES))
+        : { value: null, error: null },
+      names.has(SECRETS_WORKER)
+        ? settle(getSecretsStatus())
+        : { value: undefined, error: null },
+      names.has(BROWSER_WORKER)
+        ? settle(readChromiumState())
+        : { value: null, error: null },
       names.has(JUDGE_HUB_WORKER) ? readJudgeProvider() : null,
     ])
+    if (browser.value) setChromiumMissing(chromiumMissing(browser.value))
     setSnapshot({
       tools: tools.value ?? [],
       toolsError: tools.error,
@@ -180,10 +205,24 @@ export function useOnboarding(
       detections: detections.value,
       envFile: envFileName(secrets.value?.env_file),
       installed: names,
-      consoleConfig,
       judgeProvider,
+      consoleConfig,
+      browser: browser.value,
+      browserError: browser.error,
     })
     setScanning(false)
+  }, [])
+
+  /** Read Chromium again (after installing it by hand), nothing else. */
+  const checkChromium = useCallback(async () => {
+    const browser = await settle(readChromiumState())
+    if (browser.value) setChromiumMissing(chromiumMissing(browser.value))
+    setSnapshot((current) => ({
+      ...current,
+      browser: browser.value ?? current.browser,
+      browserError: browser.error,
+    }))
+    return browser.value
   }, [])
 
   useEffect(() => {
@@ -211,14 +250,13 @@ export function useOnboarding(
       let ok = true
       for (const step of steps) {
         const id = nextId.current++
-        const { title, detail } = describeStep(step)
         setActivity((current) => [
           ...current,
           {
             id,
             group,
-            title,
-            detail,
+            title: describeStep(step),
+            detail: stepDetail(step),
             status: 'running',
             workers: step.kind === 'add-workers' ? step.workers : undefined,
           },
@@ -248,6 +286,60 @@ export function useOnboarding(
     [patch, refresh, snapshot.consoleConfig],
   )
 
+  const [chromiumProgress, setChromiumProgress] =
+    useState<ChromiumInstallProgress | null>(null)
+
+  /**
+   * Download Chromium for the browser worker, logged like any other setup
+   * action, with every progress event kept for the step's progress bar.
+   */
+  const installChromium =
+    useCallback(async (): Promise<ChromiumInstallOutcome> => {
+      setRunning('browser')
+      setChromiumProgress(null)
+      const id = nextId.current++
+      setActivity((current) => [
+        ...current,
+        {
+          id,
+          group: 'browser',
+          title: 'Download Chromium',
+          status: 'running',
+        },
+      ])
+      const abort = new AbortController()
+      const token = cancel.current
+      const outcome = await followChromiumInstall({
+        signal: abort.signal,
+        onProgress: (progress) => {
+          if (token.cancelled) abort.abort()
+          setChromiumProgress(progress)
+          patch(id, {
+            note: describeProgress(progress),
+            progress: progressFraction(progress),
+          })
+        },
+      })
+      if (outcome.ok) {
+        patch(id, {
+          status: 'done',
+          note: 'Chromium is ready',
+          progress: undefined,
+        })
+      } else {
+        patch(id, {
+          status: 'failed',
+          note: outcome.hint
+            ? `${outcome.error} ${outcome.hint}`
+            : outcome.error,
+          progress: undefined,
+        })
+      }
+      await checkChromium()
+      setRunning(null)
+      return outcome
+    }, [checkChromium, patch])
+
   const judgeInstalled = snapshot.installed.has(JUDGE_HUB_WORKER)
 
   return {
@@ -258,6 +350,9 @@ export function useOnboarding(
     running,
     run,
     judgeInstalled,
+    checkChromium,
+    installChromium,
+    chromiumProgress,
   }
 }
 

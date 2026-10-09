@@ -19,12 +19,14 @@ export type PromptChatApi = Pick<
   modelOptions: readonly ModelOption[]
 }
 
-/** The model offers this effort. */
+/** The model offers this effort, and it is not only shown as unconfirmed. */
 function effortSupported(
   model: ModelOption | undefined,
   effort: ThinkingLevel,
 ): boolean {
-  return effortOptionsFor(model).some((option) => option.effort === effort)
+  return effortOptionsFor(model).some(
+    (option) => option.effort === effort && !option.disabled,
+  )
 }
 
 /**
