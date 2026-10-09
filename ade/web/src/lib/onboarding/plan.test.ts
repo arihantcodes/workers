@@ -258,11 +258,58 @@ describe('connectPlan', () => {
       new Set(),
       choices,
     )
-    expect(extra.title).toBe('Github Copilot')
+    expect(extra.title).toBe('GitHub Copilot')
     expect(extra.reason).toBe('GitHub Copilot subscription provider worker')
     expect(
       connectPlan([{ choice: extra }], new Set()).map((s) => s.kind),
     ).toEqual(['add-workers'])
+  })
+
+  it('keeps a running registry provider in the list, connected', () => {
+    const [copilot] = registryChoices(
+      [{ name: 'provider-github-copilot', description: null, version: null }],
+      new Set(['provider-github-copilot']),
+      choices,
+      [
+        {
+          id: 'github-copilot',
+          title: 'GitHub Copilot',
+          configured: true,
+          available: true,
+          modelCount: 2,
+        },
+      ],
+    )
+    expect(copilot).toMatchObject({
+      installed: true,
+      ready: true,
+      modelCount: 2,
+    })
+  })
+
+  it('removes a connected provider the user unchecked, after everything else', () => {
+    const claude = byId(choices, 'claude-code')
+    const plan = connectPlan(
+      [{ choice: claude }],
+      new Set(['llm-router', 'provider-anthropic']),
+      '.env',
+      [byId(choices, 'anthropic')],
+    )
+    expect(plan.map((step) => step.kind)).toEqual([
+      'add-workers',
+      'wait-models',
+      'remove-workers',
+    ])
+    expect(describeStep(plan[2])).toEqual({
+      title: 'Remove the provider-anthropic worker',
+      detail: 'compose::remove provider-anthropic',
+    })
+    // Nothing to add: the removal is the whole plan.
+    expect(
+      connectPlan([], new Set(['provider-anthropic']), '.env', [
+        byId(choices, 'anthropic'),
+      ]).map((step) => step.kind),
+    ).toEqual(['remove-workers'])
   })
 })
 
@@ -270,8 +317,7 @@ describe('judgePlan', () => {
   it('sets up the hosted judge with its key behind a reference', () => {
     const jev = JUDGE_OPTIONS[0]
     const plan = judgePlan(
-      jev,
-      { mode: 'paste', value: 'ts-key-123456' },
+      [{ option: jev, key: { mode: 'paste', value: 'ts-key-123456' } }],
       new Set(['secrets']),
     )
     expect(plan.map((step) => step.kind)).toEqual([
@@ -296,7 +342,7 @@ describe('judgePlan', () => {
   it('needs no key for a local judge', () => {
     const laya = JUDGE_OPTIONS.find((option) => option.id === 'laya')
     if (!laya) throw new Error('no laya')
-    const plan = judgePlan(laya, undefined, new Set(['judge']))
+    const plan = judgePlan([{ option: laya }], new Set(['judge']))
     expect(plan.map((step) => step.kind)).toEqual([
       'add-workers',
       'set-config',
@@ -305,6 +351,55 @@ describe('judgePlan', () => {
     const add = plan[0]
     if (add.kind !== 'add-workers') throw new Error('expected add-workers')
     expect(add.workers).toEqual(['judge-laya'])
+  })
+
+  it('adds every checked strategy and makes the first the default', () => {
+    const [jev, laya] = JUDGE_OPTIONS
+    const plan = judgePlan(
+      [
+        { option: jev, key: { mode: 'paste', value: 'ts-key-123456' } },
+        { option: laya },
+      ],
+      new Set(['secrets']),
+    )
+    const add = plan[0]
+    if (add.kind !== 'add-workers') throw new Error('expected add-workers')
+    expect(add.workers).toEqual(['judge', 'judge-typesafe', 'judge-laya'])
+    expect(plan).toContainEqual({
+      kind: 'set-config',
+      configuration: 'judge',
+      path: ['provider'],
+      value: 'typesafe',
+    })
+    expect(plan[plan.length - 1]).toMatchObject({
+      kind: 'check-judge',
+      title: 'Jev by TypeSafe',
+    })
+  })
+
+  it('leaves a running default alone and removes what was unchecked', () => {
+    const [jev, laya, decider] = JUDGE_OPTIONS
+    const running = new Set(['judge', 'judge-typesafe', 'judge-laya'])
+    // Nothing changed: nothing to run.
+    expect(
+      judgePlan([{ option: laya }, { option: jev }], running, {
+        currentDefault: 'laya',
+      }),
+    ).toEqual([])
+    const plan = judgePlan([{ option: laya }], running, {
+      removals: [jev],
+      currentDefault: 'laya',
+    })
+    expect(plan).toEqual([
+      { kind: 'remove-workers', workers: ['judge-typesafe'] },
+    ])
+    // Everything unchecked: the hub goes with the last strategy.
+    expect(judgePlan([], running, { removals: [jev, laya, decider] })).toEqual([
+      {
+        kind: 'remove-workers',
+        workers: ['judge-typesafe', 'judge-laya', 'judge'],
+      },
+    ])
   })
 })
 

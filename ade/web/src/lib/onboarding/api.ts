@@ -20,7 +20,7 @@ import {
   storeKey,
 } from '@/lib/secrets'
 import { fetchEngineWorkersList } from '@/pages/Workers/api/workers'
-import { workerSource } from './catalog'
+import { JUDGE_HUB_WORKER, workerSource } from './catalog'
 import type { PlanStep, ProviderState, ToolScan } from './plan'
 import { setPath } from './plan'
 
@@ -59,9 +59,10 @@ const MODELS_TIMEOUT_MS = 90_000
 /** A local judge may download its model on first start. */
 const JUDGE_TIMEOUT_MS = 600_000
 const CONFIGURATION_TIMEOUT_MS = 30_000
+const WORKER_STOP_TIMEOUT_MS = 60_000
 
 const sleep = (ms: number) =>
-  new Promise<void>((resolve) => window.setTimeout(resolve, ms))
+  new Promise<void>((resolve) => setTimeout(resolve, ms))
 
 /**
  * An error as the wizard shows it: its own messages keep their sentence
@@ -206,6 +207,26 @@ async function configurationId(family: string): Promise<string | null> {
   return resolution.kind === 'resolved' ? resolution.id : null
 }
 
+/**
+ * The judge hub's default strategy (`provider` in its configuration), or
+ * `null` when the hub is not running or cannot say. Setup reads it so it
+ * names the strategy that actually answers, not the first one installed.
+ */
+export async function readJudgeProvider(): Promise<string | null> {
+  try {
+    const id = await configurationId(JUDGE_HUB_WORKER)
+    if (!id) return null
+    const client = await getIiiClient()
+    const current = await client.trigger<{ value?: unknown }>(
+      'configuration::get',
+      { id },
+    )
+    return asString(asRecord(current?.value)?.provider) ?? null
+  } catch {
+    return null
+  }
+}
+
 export interface RunContext {
   consoleConfig: Record<string, unknown> | null
   report: (progress: StepProgress) => void
@@ -220,6 +241,8 @@ export async function runStep(
   switch (step.kind) {
     case 'add-workers':
       return addWorkers(step.workers, context)
+    case 'remove-workers':
+      return removeWorkers(step.workers, context)
     case 'store-secret':
       return storeSecret(step)
     case 'set-config':
@@ -239,6 +262,27 @@ interface OperationSnapshot {
   last_event?: { detail?: string; container?: string | null } | null
 }
 
+/**
+ * The compose file the daemon has loaded, for `compose::add` and
+ * `compose::remove`. Without it, compose looks for `worker-compose.yaml` in
+ * its own working directory — not where a daemon started with `--file`
+ * from another directory (`workers-dev` at the repo root, the harness's
+ * file under `harness/`) keeps its project, which fails with "no
+ * worker-compose.yaml here". `undefined` when the daemon cannot say, in
+ * which case compose keeps its default.
+ */
+async function composeProjectFile(): Promise<string | undefined> {
+  const client = await getIiiClient()
+  try {
+    const list = await client.trigger<{
+      projects?: { file?: string; namespace?: string }[]
+    }>('compose::list', {}, { timeoutMs: 10_000 })
+    return list?.projects?.find((project) => project.file)?.file
+  } catch {
+    return undefined
+  }
+}
+
 async function addWorkers(
   workers: readonly string[],
   { consoleConfig, report, signal }: RunContext,
@@ -249,33 +293,13 @@ async function addWorkers(
   if (missing.length === 0) return { note: 'already running' }
   const sources = missing.map((worker) => workerSource(worker, consoleConfig))
   report({ note: 'asking compose to declare them' })
+  const file = await composeProjectFile()
   const accepted = await client.trigger<{ operation_id?: string }>(
     'compose::add',
-    { workers: sources },
+    { ...(file ? { file } : {}), workers: sources },
     { timeoutMs: COMPOSE_ADD_TIMEOUT_MS },
   )
-  const operationId = accepted?.operation_id
-  if (operationId) {
-    for (;;) {
-      if (signal.cancelled) throw new Error('cancelled')
-      const snapshot = await client.trigger<OperationSnapshot>(
-        'compose::operation',
-        { operation_id: operationId },
-        { timeoutMs: 10_000 },
-      )
-      const detail = snapshot.last_event?.detail
-      report({
-        note: [snapshot.phase, detail].filter(Boolean).join(' · '),
-        progress:
-          snapshot.total > 0 ? snapshot.completed / snapshot.total : undefined,
-      })
-      if (snapshot.status === 'failed' || snapshot.status === 'cancelled') {
-        throw new Error(detail || `compose ${snapshot.status}`)
-      }
-      if (snapshot.status === 'succeeded') break
-      await sleep(OPERATION_POLL_MS)
-    }
-  }
+  await followOperation(accepted?.operation_id, { report, signal })
   const deadline = Date.now() + WORKER_START_TIMEOUT_MS
   for (;;) {
     const names = await installedWorkerNames()
@@ -289,6 +313,66 @@ async function addWorkers(
     await sleep(1_500)
   }
   return { note: `${missing.join(', ')} running` }
+}
+
+/** Take workers out of the project and wait until they disconnect. */
+async function removeWorkers(
+  workers: readonly string[],
+  { report, signal }: RunContext,
+): Promise<StepResult> {
+  const client = await getIiiClient()
+  const before = await installedWorkerNames()
+  const present = workers.filter((worker) => before.has(worker))
+  if (present.length === 0) return { note: 'already removed' }
+  report({ note: 'asking compose to remove them' })
+  const file = await composeProjectFile()
+  const accepted = await client.trigger<{ operation_id?: string }>(
+    'compose::remove',
+    { ...(file ? { file } : {}), workers: present },
+    { timeoutMs: COMPOSE_ADD_TIMEOUT_MS },
+  )
+  await followOperation(accepted?.operation_id, { report, signal })
+  const deadline = Date.now() + WORKER_STOP_TIMEOUT_MS
+  for (;;) {
+    const names = await installedWorkerNames()
+    const lingering = present.filter((worker) => names.has(worker))
+    if (lingering.length === 0) break
+    if (signal.cancelled) throw new Error('cancelled')
+    if (Date.now() > deadline) {
+      throw new Error(`${lingering.join(', ')} did not stop in time`)
+    }
+    report({ note: `waiting for ${lingering.join(', ')} to disconnect` })
+    await sleep(1_000)
+  }
+  return { note: `${present.join(', ')} removed` }
+}
+
+/** Report a compose operation's phase until it finishes; throws on failure. */
+async function followOperation(
+  operationId: string | undefined,
+  { report, signal }: Pick<RunContext, 'report' | 'signal'>,
+): Promise<void> {
+  if (!operationId) return
+  const client = await getIiiClient()
+  for (;;) {
+    if (signal.cancelled) throw new Error('cancelled')
+    const snapshot = await client.trigger<OperationSnapshot>(
+      'compose::operation',
+      { operation_id: operationId },
+      { timeoutMs: 10_000 },
+    )
+    const detail = snapshot.last_event?.detail
+    report({
+      note: [snapshot.phase, detail].filter(Boolean).join(' · '),
+      progress:
+        snapshot.total > 0 ? snapshot.completed / snapshot.total : undefined,
+    })
+    if (snapshot.status === 'failed' || snapshot.status === 'cancelled') {
+      throw new Error(detail || `compose ${snapshot.status}`)
+    }
+    if (snapshot.status === 'succeeded') return
+    await sleep(OPERATION_POLL_MS)
+  }
 }
 
 async function storeSecret(

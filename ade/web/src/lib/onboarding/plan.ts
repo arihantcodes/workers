@@ -105,25 +105,33 @@ export interface RegistryProviderRow {
 }
 
 /**
- * Registry provider workers that are neither in the wizard's catalog nor
- * already running: offered as "add the worker, configure it afterwards".
+ * Registry provider workers the wizard's catalog does not cover: offered as
+ * "add the worker, configure it afterwards". One already running stays in
+ * the list, marked connected, so every provider keeps its place whatever
+ * its state.
  */
 export function registryChoices(
   rows: readonly RegistryProviderRow[],
   installedWorkers: ReadonlySet<string>,
   known: readonly ProviderChoice[],
+  providers: readonly ProviderState[] = [],
 ): RegistryChoice[] {
   const knownWorkers = new Set(known.map((choice) => choice.worker))
+  const byProvider = new Map(providers.map((entry) => [entry.id, entry]))
   return rows
-    .filter(
-      (row) => !knownWorkers.has(row.name) && !installedWorkers.has(row.name),
-    )
+    .filter((row) => !knownWorkers.has(row.name))
     .map((row) => {
       const providerId = row.name.replace(/^provider-/, '')
-      const title = providerId
-        .split(/[-_]/)
-        .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
-        .join(' ')
+      const installed = installedWorkers.has(row.name)
+      const modelCount = installed
+        ? (byProvider.get(providerId)?.modelCount ?? 0)
+        : 0
+      const title =
+        REGISTRY_TITLES[providerId] ??
+        providerId
+          .split(/[-_]/)
+          .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+          .join(' ')
       return {
         kind: 'registry',
         providerId,
@@ -131,15 +139,23 @@ export function registryChoices(
         title,
         description: row.description,
         version: row.version,
-        ready: false,
-        installed: false,
+        ready: modelCount > 0,
+        installed,
         recommended: false,
         reason:
           firstSentence(row.description) ??
           'A provider worker from the registry.',
-        modelCount: 0,
+        modelCount,
       }
     })
+}
+
+/** Names a slug cannot spell: brand casing and punctuation. */
+const REGISTRY_TITLES: Record<string, string> = {
+  'github-copilot': 'GitHub Copilot',
+  llamacpp: 'llama.cpp',
+  'llama-cpp': 'llama.cpp',
+  'opencode-go': 'OpenCode Go',
 }
 
 function firstSentence(text: string | null): string | null {
@@ -263,6 +279,8 @@ export type PlanStep =
       workers: string[]
       why: Record<string, string>
     }
+  /** Unchecked in setup: take the worker out of the project again. */
+  | { kind: 'remove-workers'; workers: string[] }
   | {
       kind: 'store-secret'
       name: string
@@ -302,9 +320,15 @@ export function connectPlan(
   installedWorkers: ReadonlySet<string>,
   /** The secrets worker's env file, by name. */
   envFile: string = DEFAULT_ENV_FILE,
+  /** Connected providers the user unchecked: removed last. */
+  removals: readonly ProviderChoice[] = [],
 ): PlanStep[] {
   const pending = selections.filter(({ choice }) => !choice.ready)
-  if (pending.length === 0) return []
+  const removing = removeStep(
+    removals.map((choice) => choice.worker),
+    installedWorkers,
+  )
+  if (pending.length === 0) return removing
   const why: Record<string, string> = {}
   const keyed = pending.filter(
     (selection) => selection.choice.kind === 'key' && selection.key,
@@ -355,7 +379,20 @@ export function connectPlan(
       title: choice.title,
     })
   }
-  return steps
+  return [...steps, ...removing]
+}
+
+/** One `compose::remove` for whichever of `workers` is running. */
+function removeStep(
+  workers: readonly string[],
+  installedWorkers: ReadonlySet<string>,
+): PlanStep[] {
+  const running = [...new Set(workers)].filter((worker) =>
+    installedWorkers.has(worker),
+  )
+  return running.length > 0
+    ? [{ kind: 'remove-workers', workers: running }]
+    : []
 }
 
 /**
@@ -388,28 +425,65 @@ function keyReferenceSteps(
   ]
 }
 
-/** The actions that set Judge up with one strategy. */
+export interface JudgeSelection {
+  option: JudgeOption
+  /** A hosted option not running yet needs one. */
+  key?: KeyInput
+}
+
+/**
+ * The actions that leave Judge answering with exactly the checked options:
+ * add the hub and every checked strategy not running yet (keys behind
+ * references), make the first checked one the hub's default, prove it
+ * answers, then remove the strategies that were unchecked — and the hub
+ * with them when nothing is left to answer.
+ */
 export function judgePlan(
-  option: JudgeOption,
-  key: KeyInput | undefined,
+  selections: readonly JudgeSelection[],
   installedWorkers: ReadonlySet<string>,
+  {
+    removals = [],
+    currentDefault = null,
+  }: {
+    /** Running strategies the user unchecked. */
+    removals?: readonly JudgeOption[]
+    /** The hub's `provider` setting now, when it is running. */
+    currentDefault?: string | null
+  } = {},
 ): PlanStep[] {
+  const hubRunning = installedWorkers.has(JUDGE_HUB_WORKER)
+  if (selections.length === 0) {
+    return removeStep(
+      [
+        ...removals.map((option) => option.worker),
+        ...(removals.length > 0 ? [JUDGE_HUB_WORKER] : []),
+      ],
+      installedWorkers,
+    )
+  }
   const why: Record<string, string> = {}
-  if (option.envVar && key && !installedWorkers.has(SECRETS_WORKER)) {
+  const keyed = selections.filter(
+    ({ option, key }) =>
+      option.envVar && key && !installedWorkers.has(option.worker),
+  )
+  if (keyed.length > 0 && !installedWorkers.has(SECRETS_WORKER)) {
     why[SECRETS_WORKER] =
       'Stores API keys encrypted, outside every file you commit.'
   }
-  if (!installedWorkers.has(JUDGE_HUB_WORKER)) {
+  if (!hubRunning) {
     why[JUDGE_HUB_WORKER] =
       'The hub harness, function search and the browser ask for decisions.'
   }
-  if (!installedWorkers.has(option.worker)) {
-    why[option.worker] = `Answers those decisions with ${option.title}.`
+  for (const { option } of selections) {
+    if (!installedWorkers.has(option.worker)) {
+      why[option.worker] = `Answers those decisions with ${option.title}.`
+    }
   }
   const steps: PlanStep[] = []
   const workers = Object.keys(why)
   if (workers.length > 0) steps.push({ kind: 'add-workers', workers, why })
-  if (option.envVar && key) {
+  for (const { option, key } of keyed) {
+    if (!option.envVar || !key) continue
     steps.push(...keyReferenceSteps(option.envVar, key, [option.worker]))
     steps.push({
       kind: 'set-config',
@@ -418,18 +492,30 @@ export function judgePlan(
       value: keyReference(option.envVar, key),
     })
   }
-  steps.push({
-    kind: 'set-config',
-    configuration: JUDGE_HUB_WORKER,
-    path: ['provider'],
-    value: option.id,
-  })
-  steps.push({
-    kind: 'check-judge',
-    title: option.title,
-    hosted: option.envVar !== undefined,
-  })
-  return steps
+  const primary = selections[0].option
+  const changesDefault = !hubRunning || currentDefault !== primary.id
+  if (changesDefault) {
+    steps.push({
+      kind: 'set-config',
+      configuration: JUDGE_HUB_WORKER,
+      path: ['provider'],
+      value: primary.id,
+    })
+  }
+  if (workers.length > 0 || changesDefault) {
+    steps.push({
+      kind: 'check-judge',
+      title: primary.title,
+      hosted: primary.envVar !== undefined,
+    })
+  }
+  return [
+    ...steps,
+    ...removeStep(
+      removals.map((option) => option.worker),
+      installedWorkers,
+    ),
+  ]
 }
 
 /** One line per step, as the plan preview and the activity log show it. */
@@ -445,6 +531,14 @@ export function describeStep(step: PlanStep): {
             ? `Add the ${step.workers[0]} worker`
             : `Add ${step.workers.length} workers`,
         detail: `compose::add ${step.workers.join(' ')}`,
+      }
+    case 'remove-workers':
+      return {
+        title:
+          step.workers.length === 1
+            ? `Remove the ${step.workers[0]} worker`
+            : `Remove ${step.workers.length} workers`,
+        detail: `compose::remove ${step.workers.join(' ')}`,
       }
     case 'store-secret': {
       const reference = keyReference(step.name, step.input)

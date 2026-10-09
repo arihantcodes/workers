@@ -149,7 +149,7 @@ function groupByProvider(options: ModelOption[]): ModelGroup[] {
     .map(([label, opts]) => ({ label, options: opts }))
 }
 
-function effortOptionsFor(
+export function effortOptionsFor(
   model: ModelOption | undefined,
 ): ReasoningEffortOption[] {
   if (!model) return []

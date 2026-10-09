@@ -67,3 +67,73 @@ describe('runStep store-secret', () => {
     expect(result.note).toBe('stored sk-e2e…7777')
   })
 })
+
+describe('runStep add-workers', () => {
+  const FILE = '/repo/harness/worker-compose.yaml'
+  const installed = new Set<string>()
+  /** One connected worker, as `engine::workers::list` describes it. */
+  const summary = (name: string) => ({
+    id: name,
+    name,
+    status: 'connected',
+    function_count: 1,
+    connected_at_ms: 0,
+    active_invocations: 0,
+  })
+
+  beforeEach(() => {
+    installed.clear()
+    trigger.mockReset()
+    trigger.mockImplementation(async (fn: string) => {
+      if (fn === 'compose::list') {
+        return { projects: [{ file: FILE, namespace: 'my-project' }] }
+      }
+      if (fn === 'compose::add') {
+        installed.add('provider-claude-code')
+        return { operation_id: undefined }
+      }
+      // engine::workers::list, before and after the add
+      return { workers: [...installed].map(summary) }
+    })
+  })
+
+  it('names the file the daemon loaded, not whatever is in its working directory', async () => {
+    await runStep(
+      {
+        kind: 'add-workers',
+        workers: ['provider-claude-code'],
+        why: { 'provider-claude-code': 'Claude Code' },
+      },
+      context,
+    )
+    expect(trigger).toHaveBeenCalledWith(
+      'compose::add',
+      { file: FILE, workers: ['provider-claude-code'] },
+      expect.anything(),
+    )
+  })
+
+  it('lets compose keep its default when the daemon cannot say', async () => {
+    trigger.mockImplementation(async (fn: string) => {
+      if (fn === 'compose::list') throw new Error('function_not_found')
+      if (fn === 'compose::add') {
+        installed.add('provider-claude-code')
+        return {}
+      }
+      return { workers: [...installed].map(summary) }
+    })
+    await runStep(
+      {
+        kind: 'add-workers',
+        workers: ['provider-claude-code'],
+        why: { 'provider-claude-code': 'Claude Code' },
+      },
+      context,
+    )
+    expect(trigger).toHaveBeenCalledWith(
+      'compose::add',
+      { workers: ['provider-claude-code'] },
+      expect.anything(),
+    )
+  })
+})

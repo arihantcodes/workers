@@ -4,6 +4,7 @@ import {
   installedWorkerNames,
   readableError,
   readConsoleConfig,
+  readJudgeProvider,
   readProviderStates,
   runStep,
   scanMachine,
@@ -55,6 +56,8 @@ export interface MachineSnapshot {
   envFile: string
   installed: ReadonlySet<string>
   consoleConfig: Record<string, unknown> | null
+  /** The judge hub's default strategy id, when the hub is running. */
+  judgeProvider: string | null
 }
 
 const EMPTY: MachineSnapshot = {
@@ -66,6 +69,7 @@ const EMPTY: MachineSnapshot = {
   envFile: envFileName(null),
   installed: new Set(),
   consoleConfig: null,
+  judgeProvider: null,
 }
 
 const PROVIDER_WORKERS = new Map(
@@ -154,15 +158,18 @@ export function useOnboarding(
       readConsoleConfig(),
     ])
     const names = installed.value ?? new Set<string>()
-    const [detections, secrets] = names.has(SECRETS_WORKER)
-      ? await Promise.all([
-          settle(detectKeys(DETECTED_KEY_NAMES)),
-          settle(getSecretsStatus()),
-        ])
-      : [
-          { value: null, error: null },
-          { value: undefined, error: null },
-        ]
+    const [[detections, secrets], judgeProvider] = await Promise.all([
+      names.has(SECRETS_WORKER)
+        ? Promise.all([
+            settle(detectKeys(DETECTED_KEY_NAMES)),
+            settle(getSecretsStatus()),
+          ])
+        : ([
+            { value: null, error: null },
+            { value: undefined, error: null },
+          ] as const),
+      names.has(JUDGE_HUB_WORKER) ? readJudgeProvider() : null,
+    ])
     setSnapshot({
       tools: tools.value ?? [],
       toolsError: tools.error,
@@ -174,6 +181,7 @@ export function useOnboarding(
       envFile: envFileName(secrets.value?.env_file),
       installed: names,
       consoleConfig,
+      judgeProvider,
     })
     setScanning(false)
   }, [])
