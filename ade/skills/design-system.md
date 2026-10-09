@@ -51,11 +51,13 @@ The console's sans (Geist, Inter fallback): 16px step titles, 14px leads, 13px
 rows and labels, 12px captions and 11px chips. One 24px gutter (16px below
 `@md`); `rounded-lg` cards with `divide-y` hairlines, 4px checkboxes, and pill
 (`rounded-full`) buttons and chips — solid ink primary, soft neutral fill
-secondary, ghost tertiary, all with semibold 13px labels. Interactive fills step
-through the surface ramp only — `surface-hover` on hover, `surface-selected` on
-a checked card or row, the soft secondary button at `surface-hover` rising to
-`surface-selected` — never a raw `neutral-*` value, so every state is the same
-step in both themes. All setup
+secondary, ghost tertiary, all with semibold 13px labels. Small controls (rail steps,
+ghost buttons, disclosures) hover with `surface-hover`. Large fills — cards,
+rows, strips, the code surface, the soft secondary button — use the neutral
+palette one step per theme (`neutral-50`/`100` on white, `neutral-900`/`800`
+on `neutral-950`), because the alpha surface ramp reads as a grey slab across a
+whole card in the light theme; a checked card is `neutral-100` with a
+`neutral-400` stroke (`neutral-900` with `neutral-600` in the dark theme). All setup
 presentation uses Tailwind utilities in `ade/web/src/components/onboarding`,
 with no custom setup stylesheet. Short Motion step transitions honor reduced
 motion. Provider choices remain visible and stable as their state changes.

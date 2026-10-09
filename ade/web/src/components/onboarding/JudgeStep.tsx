@@ -164,7 +164,7 @@ export function JudgeStep({
 
       <section
         aria-label="What Judge does"
-        className="rounded-lg border border-neutral-200 bg-surface dark:border-neutral-800"
+        className="rounded-lg border border-neutral-200 bg-neutral-50 dark:border-neutral-800 dark:bg-neutral-900"
       >
         <ul className="grid divide-y divide-neutral-200 @md:grid-cols-3 @md:divide-x @md:divide-y-0 dark:divide-neutral-800">
           {JUDGE_USES.map((use) => {
@@ -277,9 +277,11 @@ function JudgeRow({
       className={cn(
         'flex flex-col rounded-lg border transition-[background-color,border-color] duration-150 ease-[var(--motion-ease-standard)]',
         checked
-          ? 'border-neutral-300 bg-surface-selected dark:border-neutral-700'
-          : 'border-neutral-200 bg-transparent dark:border-neutral-800',
-        !disabled && !checked && 'hover:bg-surface-hover',
+          ? 'border-neutral-400 bg-neutral-100 dark:border-neutral-600 dark:bg-neutral-900'
+          : 'border-neutral-200 bg-white dark:border-neutral-800 dark:bg-neutral-950',
+        !disabled &&
+          !checked &&
+          'hover:bg-neutral-50 dark:hover:bg-neutral-900',
       )}
     >
       <div className="flex items-start gap-3 px-3.5 py-3">

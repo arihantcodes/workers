@@ -32,7 +32,7 @@ export function Button({
         // same one-step change in both themes, on any base.
         variant === 'primary' && 'bg-ink text-bg hover:bg-ink/85',
         variant === 'outline' &&
-          'bg-surface-hover text-ink hover:bg-surface-selected hover:text-ink',
+          'bg-neutral-100 text-ink hover:bg-neutral-200 hover:text-ink dark:bg-neutral-800 dark:hover:bg-neutral-700',
         variant === 'ghost' &&
           'px-4 text-ink-faint hover:bg-surface-hover hover:text-ink',
         className,

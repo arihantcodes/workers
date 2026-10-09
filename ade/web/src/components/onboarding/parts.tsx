@@ -296,8 +296,8 @@ export function EngineLog({
                   className={cn(
                     'break-words',
                     entry.status === 'failed'
-                      ? 'text-rose-300'
-                      : 'text-neutral-400',
+                      ? 'text-rose-700 dark:text-rose-300'
+                      : 'text-neutral-600 dark:text-neutral-400',
                   )}
                 >
                   {entry.status === 'failed' ? '✗ ' : '→ '}
@@ -349,7 +349,9 @@ function LogLine({
         <span
           className={cn(
             'font-sans text-[13px] font-medium',
-            tone === 'queued' ? 'text-neutral-400' : 'text-neutral-100',
+            tone === 'queued'
+              ? 'text-neutral-500 dark:text-neutral-400'
+              : 'text-ink',
           )}
         >
           {title}
@@ -360,7 +362,7 @@ function LogLine({
           </span>
         ) : null}
       </span>
-      <span className="break-all text-neutral-400">
+      <span className="break-all text-neutral-600 dark:text-neutral-400">
         <span aria-hidden className="select-none text-neutral-500">
           ${' '}
         </span>
@@ -390,7 +392,7 @@ function LogGlyph({
         className={cn(
           className,
           'animate-spin motion-reduce:animate-none',
-          terminal ? 'text-neutral-100' : 'text-ink',
+          'text-ink',
         )}
       />
     )
@@ -399,7 +401,10 @@ function LogGlyph({
     return (
       <CircleAlert
         aria-label="failed"
-        className={cn(className, terminal ? 'text-rose-400' : 'text-alert')}
+        className={cn(
+          className,
+          terminal ? 'text-rose-700 dark:text-rose-400' : 'text-alert',
+        )}
       />
     )
   }
@@ -420,15 +425,19 @@ function LogGlyph({
   return (
     <Check
       aria-label="done"
-      className={cn(className, terminal ? 'text-emerald-400' : 'text-ink')}
+      className={cn(
+        className,
+        terminal ? 'text-emerald-700 dark:text-emerald-400' : 'text-ink',
+      )}
     />
   )
 }
 
 /**
- * A terminal block: one or more shell commands to run elsewhere, on a
- * dark surface in either theme, with the program, its flags and a trailing
- * comment coloured the way a shell would. Each line has a round copy button
+ * A terminal block: one or more shell commands to run elsewhere, on the
+ * neutral code surface (a light panel in the light theme, a raised dark one
+ * in the dark theme), with the program, its flags and a trailing comment
+ * coloured the way a shell would. Each line has a round copy button
  * that shows a check for a moment once the command is on the clipboard.
  */
 export function Terminal({ children }: { children: React.ReactNode }) {
@@ -439,9 +448,9 @@ export function Terminal({ children }: { children: React.ReactNode }) {
   )
 }
 
-/** The dark terminal surface, the same in both themes. */
+/** The code surface: one neutral step off the dialog in either theme. */
 const TERMINAL_SURFACE =
-  'flex flex-col rounded-lg bg-neutral-950 px-4 py-3 font-code text-neutral-100 dark:bg-neutral-900 dark:ring-1 dark:ring-white/10 dark:ring-inset'
+  'flex flex-col rounded-lg border border-neutral-200 bg-neutral-50 px-4 py-3 font-code text-ink dark:border-neutral-800 dark:bg-neutral-900'
 
 export function CommandLine({
   command,
@@ -474,13 +483,17 @@ export function CommandLine({
         <span aria-hidden className="select-none text-neutral-500">
           ${' '}
         </span>
-        <span className="font-medium text-emerald-400">{program}</span>
+        <span className="font-medium text-emerald-700 dark:text-emerald-400">
+          {program}
+        </span>
         {rest.map((token, index) => (
           <span
             // biome-ignore lint/suspicious/noArrayIndexKey: tokens of one fixed string
             key={index}
             className={
-              token.startsWith('-') ? 'text-sky-300' : 'text-neutral-100'
+              token.startsWith('-')
+                ? 'text-sky-700 dark:text-sky-300'
+                : 'text-ink'
             }
           >
             {' '}
@@ -497,7 +510,7 @@ export function CommandLine({
         type="button"
         onClick={copy}
         aria-label={`Copy ${command}`}
-        className="relative -my-1 flex size-8 shrink-0 items-center justify-center rounded-full text-neutral-400 transition-colors duration-150 hover:bg-white/10 hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/60 focus-visible:ring-offset-2 focus-visible:ring-offset-neutral-950 dark:focus-visible:ring-offset-neutral-900"
+        className="relative -my-1 flex size-8 shrink-0 items-center justify-center rounded-full text-neutral-500 transition-colors duration-150 hover:bg-neutral-200/70 hover:text-ink focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-rule-focus focus-visible:ring-offset-2 focus-visible:ring-offset-neutral-50 dark:text-neutral-400 dark:hover:bg-white/10 dark:focus-visible:ring-offset-neutral-900"
       >
         <Copy
           aria-hidden
@@ -510,7 +523,7 @@ export function CommandLine({
           aria-hidden
           strokeWidth={2.5}
           className={cn(
-            'absolute size-4 text-emerald-400 transition-[opacity,transform] duration-150 ease-[var(--motion-ease-standard)] motion-reduce:transition-none',
+            'absolute size-4 text-emerald-700 transition-[opacity,transform] duration-150 ease-[var(--motion-ease-standard)] motion-reduce:transition-none dark:text-emerald-400',
             copied ? 'scale-100 opacity-100' : 'scale-25 opacity-0',
           )}
         />

@@ -278,8 +278,9 @@ describe('ReadyStep', () => {
     expect(html).toContain('Your harness is ready')
     expect(html).toContain('Claude Code connected')
     expect(html).toContain('key at secret://ANTHROPIC_API_KEY')
-    expect(html).toContain('Your keys stay out of git')
-    expect(html).toContain('configuration holds only secret:// references')
+    // Where the keys live is not a summary line: it reads as jargon here.
+    expect(html).not.toContain('Your keys stay out of git')
+    expect(html).not.toContain('configuration holds only')
     expect(html).toContain('Workers added')
     expect(html).toContain('provider-claude-code')
     expect(html).not.toContain('ready in every chat')
@@ -300,10 +301,7 @@ describe('ReadyStep', () => {
       ],
     })
     expect(html).toContain('key at env://OPENAI_API_KEY')
-    expect(html).toContain('Your keys stay out of configuration')
-    expect(html).toContain(
-      'configuration holds only secret:// and env:// references',
-    )
+    expect(html).not.toContain('Your keys stay out of configuration')
   })
 
   it('offers the guided tour in place of starter prompts, without naming its worker', () => {

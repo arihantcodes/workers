@@ -382,9 +382,11 @@ function ProviderTile({
       className={cn(
         'flex h-10 flex-row-reverse rounded-lg border px-3 transition-[background-color,border-color] duration-150 ease-[var(--motion-ease-standard)]',
         selected
-          ? 'border-neutral-300 bg-surface-selected dark:border-neutral-700'
-          : 'border-neutral-200 bg-transparent dark:border-neutral-800',
-        !disabled && !selected && 'hover:bg-surface-hover',
+          ? 'border-neutral-400 bg-neutral-100 dark:border-neutral-600 dark:bg-neutral-900'
+          : 'border-neutral-200 bg-white dark:border-neutral-800 dark:bg-neutral-950',
+        !disabled &&
+          !selected &&
+          'hover:bg-neutral-50 dark:hover:bg-neutral-900',
       )}
       label={
         <span className="flex min-w-0 items-center gap-2.5">
@@ -429,7 +431,7 @@ function SubscriptionRow({
     <div
       className={cn(
         'flex flex-col gap-1 px-3.5 py-2.5 transition-colors duration-150 ease-[var(--motion-ease-standard)]',
-        selected && 'bg-surface-selected',
+        selected && 'bg-neutral-100 dark:bg-neutral-900',
       )}
     >
       <div className="flex items-start gap-3">

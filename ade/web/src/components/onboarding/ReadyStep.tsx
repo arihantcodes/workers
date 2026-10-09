@@ -77,14 +77,6 @@ export function ReadyStep({
         .flatMap((entry) => entry.workers ?? []),
     ),
   ]
-  const secretRefs = connected.flatMap((provider) =>
-    provider.credentialRef ? [provider.credentialRef] : [],
-  )
-  // `secret://` (encrypted) and `env://` (this project's .env), as used.
-  const schemes = [
-    ...new Set(secretRefs.map((ref) => `${ref.split('://')[0]}://`)),
-  ]
-
   const lines: { title: string; detail?: string; providerId?: string }[] = [
     ...connected.map((provider) => ({
       title: `${provider.title} connected`,
@@ -102,16 +94,6 @@ export function ReadyStep({
                     .map((option) => option.title)
                     .join(' and ')} also available`
                 : 'function search, argument repair, browser decisions',
-          },
-        ]
-      : []),
-    ...(secretRefs.length > 0
-      ? [
-          {
-            title: schemes.includes('env://')
-              ? 'Your keys stay out of configuration'
-              : 'Your keys stay out of git',
-            detail: `configuration holds only ${schemes.join(' and ')} references`,
           },
         ]
       : []),
@@ -255,7 +237,7 @@ export function ReadyStep({
                       aria-label={`Start a chat: ${prompt.title}`}
                       aria-describedby={described}
                       onClick={() => onPrompt(prompt)}
-                      className="flex w-full min-w-0 flex-col gap-1.5 rounded-lg border border-neutral-200 bg-transparent px-3 py-2.5 text-left transition-[background-color,border-color] duration-150 ease-[var(--motion-ease-standard)] hover:bg-surface-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-rule-focus focus-visible:ring-offset-2 focus-visible:ring-offset-white active:scale-[0.99] dark:border-neutral-800 dark:focus-visible:ring-offset-neutral-950"
+                      className="flex w-full min-w-0 flex-col gap-1.5 rounded-lg border border-neutral-200 bg-transparent px-3 py-2.5 text-left transition-[background-color,border-color] duration-150 ease-[var(--motion-ease-standard)] hover:bg-neutral-50 focus-visible:outline-none dark:hover:bg-neutral-900 focus-visible:ring-2 focus-visible:ring-rule-focus focus-visible:ring-offset-2 focus-visible:ring-offset-white active:scale-[0.99] dark:border-neutral-800 dark:focus-visible:ring-offset-neutral-950"
                     >
                       <span className="flex items-start gap-2">
                         <MessageSquareText
