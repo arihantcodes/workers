@@ -393,7 +393,7 @@ export function OnboardingPage({ host, onRequestClose, conversationId }: { host:
   if (!tour) {
     return (
       <Frame onClose={onRequestClose} footer={removeButton}>
-        <div className="ob-loading" aria-busy="true" aria-label="Loading the tour">
+        <div className="ob-loading" role="status" aria-busy="true" aria-label="Loading the tour">
           <Skeleton className="ob-skeleton ob-skeleton--bar" />
           <Skeleton className="ob-skeleton" />
           <Skeleton className="ob-skeleton" />
@@ -454,7 +454,9 @@ export function OnboardingPage({ host, onRequestClose, conversationId }: { host:
               data-open={isOpen || undefined}
               aria-current={state === 'active' ? 'step' : undefined}
             >
-              {last ? null : <span className="ob-line" data-done={state === 'complete' || undefined} aria-hidden="true" />}
+              {last ? null : (
+                <span className="ob-line" data-done={state === 'complete' || undefined} aria-hidden="true" />
+              )}
               {reached ? (
                 <button
                   type="button"
@@ -651,9 +653,7 @@ function RemoveOnboarding({ host, onClose }: { host: Host; onClose?: () => void 
     setRemoving(true)
     setError(null)
     try {
-      const list = await host.iii
-        .trigger<{ projects?: { file?: string }[] }>('compose::list', {})
-        .catch(() => null)
+      const list = await host.iii.trigger<{ projects?: { file?: string }[] }>('compose::list', {}).catch(() => null)
       const file = list?.projects?.find((project) => project.file)?.file
       await host.iii.trigger('compose::remove', {
         ...(file ? { file } : {}),
@@ -788,8 +788,18 @@ function Copyable({ label, text }: { label: string; text: string }) {
     <div className="ob-prompt">
       <div className="ob-prompt-head">
         <span className="ob-prompt-label">{label}</span>
-        <Button variant="ghost" size="sm" className="ob-ghost" onClick={copy} aria-label={state === 'copied' ? 'Copied' : 'Copy'}>
-          {state === 'copied' ? <Check className={uiClasses.icon} aria-hidden="true" /> : <Copy className={uiClasses.icon} aria-hidden="true" />}
+        <Button
+          variant="ghost"
+          size="sm"
+          className="ob-ghost"
+          onClick={copy}
+          aria-label={state === 'copied' ? 'Copied' : 'Copy'}
+        >
+          {state === 'copied' ? (
+            <Check className={uiClasses.icon} aria-hidden="true" />
+          ) : (
+            <Copy className={uiClasses.icon} aria-hidden="true" />
+          )}
           {state === 'copied' ? 'Copied' : 'Copy'}
         </Button>
       </div>
