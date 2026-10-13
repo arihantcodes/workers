@@ -125,9 +125,19 @@ export function ModelsStep({
     startedEmpty.current = nothingConnectedNow
   }
   const nothingConnected = startedEmpty.current ?? nothingConnectedNow
+  // A provider seen connected while the step is open stays checked: one that
+  // blinks out (re-registering after another provider signed in) must not
+  // read as the person's choice to drop it.
+  const seenReady = useRef(new Set<string>())
+  for (const choice of choices) {
+    if (choice.ready) seenReady.current.add(choice.providerId)
+  }
   const draftFor = (choice: ProviderChoice): Draft =>
     resolveDraft(drafts.get(choice.providerId), {
-      selected: choice.ready || preselected(choice, nothingConnected),
+      selected:
+        choice.ready ||
+        seenReady.current.has(choice.providerId) ||
+        preselected(choice, nothingConnected),
       key:
         choice.kind === 'key' ? defaultKeyInput(choice.detection) : undefined,
     })

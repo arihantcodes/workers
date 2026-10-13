@@ -102,7 +102,7 @@ export function Stepper({
             >
               <span
                 className={cn(
-                  'text-[13px] font-medium leading-5',
+                  'text-sm font-medium leading-5',
                   !vertical && 'truncate',
                   done || isCurrent
                     ? 'text-ink'
@@ -128,7 +128,7 @@ export function Stepper({
               {vertical && step.description ? (
                 <span
                   className={cn(
-                    'truncate text-xs leading-4',
+                    'truncate text-[13px] leading-4',
                     isCurrent
                       ? 'text-neutral-600 dark:text-neutral-400'
                       : 'text-neutral-500 dark:text-neutral-500',

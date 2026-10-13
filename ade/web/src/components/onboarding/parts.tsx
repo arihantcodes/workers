@@ -100,7 +100,7 @@ export function Section({
   return (
     <section className="flex flex-col gap-2" aria-label={title}>
       <div className="flex min-h-5 flex-wrap items-baseline justify-between gap-x-3 gap-y-0.5">
-        <h3 className="flex min-w-0 flex-wrap items-baseline gap-x-1.5 font-sans text-[13px] font-medium leading-5 text-ink">
+        <h3 className="flex min-w-0 flex-wrap items-baseline gap-x-1.5 font-sans text-[23px] font-medium leading-5 text-ink">
           <span className="shrink-0">{title}</span>
           {hint ? (
             <span className="truncate text-xs font-normal text-neutral-500 dark:text-neutral-400">
@@ -263,6 +263,25 @@ export function EngineLog({
   useEffect(() => {
     if (failed) setOpen(true)
   }, [failed])
+  // Continue starts its installs here, at the foot of a long step: open the
+  // log and bring it into view as the run starts. Once per run, so someone
+  // who folds it again keeps it folded.
+  const section = useRef<HTMLDivElement>(null)
+  const revealed = useRef(false)
+  useEffect(() => {
+    if (!running) {
+      revealed.current = false
+      return
+    }
+    // The first entry may land a render after `running` does.
+    if (revealed.current || !section.current || entries.length === 0) return
+    revealed.current = true
+    setOpen(true)
+    section.current.scrollIntoView({
+      block: 'start',
+      behavior: reduceMotion ? 'instant' : 'smooth',
+    })
+  }, [running, entries.length, reduceMotion])
   // Keep the line that is moving in view while the log is open.
   useEffect(() => {
     if (!moving || !open) return
@@ -302,7 +321,7 @@ export function EngineLog({
     )
 
   return (
-    <div className="flex flex-col gap-2">
+    <div ref={section} className="flex scroll-mt-4 flex-col gap-2">
       {/* Outside the folded (inert) log, so progress is announced while it
           is shut; no seconds in it, or it would speak every second. */}
       <span role="status" aria-live="polite" className="sr-only">

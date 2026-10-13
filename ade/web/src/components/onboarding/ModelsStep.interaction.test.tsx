@@ -254,3 +254,42 @@ describe('ModelsStep optional sign-ins', () => {
     expect(signIn()).toBeNull()
   })
 })
+
+describe('ModelsStep while a connected provider blinks out', () => {
+  const CLAUDE_SERVING: ProviderState = {
+    id: 'claude-code',
+    title: 'Claude Code',
+    configured: false,
+    available: true,
+    modelCount: 12,
+    ownsAuthentication: true,
+  }
+  const installed = new Set(['llm-router', 'provider-claude-code'])
+  const render = (providers: ProviderState[]) =>
+    act(() =>
+      root.render(
+        <ModelsStep
+          onboarding={controller({ providers, installed })}
+          onBack={() => undefined}
+          onNext={() => undefined}
+        />,
+      ),
+    )
+
+  it('keeps it checked: a blink is not the person unchecking it', () => {
+    render([CLAUDE_SERVING])
+    expect(checkbox('Claude Code').checked).toBe(true)
+    // Re-registering after another provider signed in: no models for a moment.
+    render([{ ...CLAUDE_SERVING, available: false, modelCount: 0 }])
+    expect(checkbox('Claude Code').checked).toBe(true)
+    render([CLAUDE_SERVING])
+    expect(checkbox('Claude Code').checked).toBe(true)
+  })
+
+  it('still lets the person uncheck it', () => {
+    render([CLAUDE_SERVING])
+    act(() => checkbox('Claude Code').click())
+    render([{ ...CLAUDE_SERVING, available: false, modelCount: 0 }])
+    expect(checkbox('Claude Code').checked).toBe(false)
+  })
+})

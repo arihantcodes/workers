@@ -62,6 +62,20 @@ export interface ActivityEntry {
   workers?: string[]
 }
 
+/** Looks again after a run that left a provider it did not touch serving
+ * nothing, this far apart. */
+const SETTLE_LOOKS = 4
+const SETTLE_MS = 2_000
+
+/** Providers serving usable models in `snapshot`, by id. */
+function servingProviders(snapshot: MachineSnapshot): Set<string> {
+  return new Set(
+    (snapshot.providers ?? [])
+      .filter(servesUsableModels)
+      .map((provider) => provider.id),
+  )
+}
+
 /** A step running longer than this offers "Skip for now". */
 export const SLOW_STEP_MS = 30_000
 
@@ -176,6 +190,8 @@ export function useOnboarding(
   onSettled?: () => void,
 ) {
   const [snapshot, setSnapshot] = useState<MachineSnapshot>(EMPTY)
+  /** The latest snapshot, for a run that started on an older render. */
+  const snapshotRef = useRef<MachineSnapshot>(EMPTY)
   const [scanning, setScanning] = useState(false)
   const [activity, setActivity] = useState<ActivityEntry[]>([])
   const [running, setRunning] = useState<ActivityGroup | null>(null)
@@ -208,7 +224,7 @@ export function useOnboarding(
       names.has(JUDGE_HUB_WORKER) ? readJudgeProvider() : null,
     ])
     if (browser.value) setChromiumMissing(chromiumMissing(browser.value))
-    setSnapshot({
+    const next: MachineSnapshot = {
       tools: tools.value ?? [],
       toolsError: tools.error,
       providers: providers.value
@@ -222,9 +238,17 @@ export function useOnboarding(
       consoleConfig,
       browser: browser.value,
       browserError: browser.error,
-    })
+    }
+    snapshotRef.current = next
+    setSnapshot(next)
     setScanning(false)
+    return next
   }, [])
+
+  /** Look at the machine again ("Scan again"). */
+  const rescan = useCallback(async () => {
+    await refresh()
+  }, [refresh])
 
   /** Read Chromium again (after installing it by hand), nothing else. */
   const checkChromium = useCallback(async () => {
@@ -279,6 +303,7 @@ export function useOnboarding(
   const run = useCallback(
     async (group: ActivityGroup, steps: readonly PlanStep[]) => {
       setRunning(group)
+      const servingBefore = servingProviders(snapshotRef.current)
       const consoleConfig =
         snapshot.consoleConfig ?? (await readConsoleConfig())
       let ok = true
@@ -337,7 +362,28 @@ export function useOnboarding(
           skipCurrent.current = null
         }
       }
-      await refresh()
+      // A provider that served models before this run, and that the run did
+      // not remove, reads as gone only while it re-registers (the router or
+      // its worker restarting, a slow Keychain read): look again before the
+      // step shows it disconnected. Signing in to one provider must not
+      // appear to sign the others out.
+      const removed = new Set(
+        steps.flatMap((step) =>
+          step.kind === 'remove-workers' ? step.workers : [],
+        ),
+      )
+      const kept = [...servingBefore].filter(
+        (id) => !removed.has(PROVIDER_WORKERS.get(id) ?? `provider-${id}`),
+      )
+      let after = await refresh()
+      for (let look = 0; look < SETTLE_LOOKS; look++) {
+        const serving = servingProviders(after)
+        if (kept.every((id) => serving.has(id)) || cancel.current.cancelled) {
+          break
+        }
+        await new Promise((resolve) => window.setTimeout(resolve, SETTLE_MS))
+        after = await refresh()
+      }
       setRunning(null)
       onSettledRef.current?.()
       return ok
@@ -421,7 +467,7 @@ export function useOnboarding(
   return {
     snapshot,
     scanning,
-    refresh,
+    refresh: rescan,
     activity,
     running,
     run,

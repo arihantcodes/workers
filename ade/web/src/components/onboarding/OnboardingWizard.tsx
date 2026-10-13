@@ -38,6 +38,11 @@ import {
   type ExamplePrompt,
   fetchExamplePrompts,
 } from '@/lib/onboarding/prompts'
+import {
+  reportSetupStep,
+  type SetupStepId,
+  type SetupStepProperties,
+} from '@/lib/onboarding/telemetry'
 import { prepareTour } from '@/lib/onboarding/tour'
 import { requestPanelOpen } from '@/lib/panel-context'
 import { cn } from '@/lib/utils'
@@ -197,6 +202,94 @@ export function OnboardingWizardHost() {
     [],
   )
 
+  // Usage: one announcement per step the person moves on from, read after
+  // the move renders so it sees what the step's install just changed (see
+  // `reportSetupStep`; nothing typed is reported).
+  const stepIds = steps.map((entry) => entry.id).join(',')
+  const stepStartedAt = useRef(Date.now())
+  const report = useCallback(
+    (id: SetupStepId, properties: SetupStepProperties = {}) => {
+      if (!live) return
+      // Numbered like a tour step: its place in the list setup showed.
+      // Finish comes after the last step; Closed takes the step it left.
+      const order = stepIds.split(',')
+      const at = id === 'closed' ? String(properties.at_step) : id
+      const index = order.indexOf(at)
+      reportSetupStep(id, index < 0 ? order.length + 1 : index + 1, {
+        ...properties,
+        step_ms: Date.now() - stepStartedAt.current,
+        skipped_jobs: onboarding.activity.filter(
+          (entry) => entry.status === 'skipped',
+        ).length,
+      })
+    },
+    [live, stepIds, onboarding.activity],
+  )
+  const reportRef = useRef(report)
+  reportRef.current = report
+  const outcomeRef = useRef<(id: WizardStepId) => SetupStepProperties>(
+    () => ({}),
+  )
+  outcomeRef.current = (id): SetupStepProperties => {
+    const { activity, snapshot } = onboarding
+    const did = (group: string, status: string) =>
+      activity.some((entry) => entry.group === group && entry.status === status)
+    const providers = (snapshot.providers ?? [])
+      .filter(servesUsableModels)
+      .map((provider) => provider.id)
+    switch (id) {
+      case 'welcome':
+        return { outcome: 'started' }
+      case 'models':
+        return {
+          outcome: did('models', 'done')
+            ? 'connected'
+            : providers.length > 0
+              ? 'continued'
+              : 'skipped',
+          providers,
+          provider_count: providers.length,
+        }
+      case 'browser':
+        return {
+          outcome: did('browser', 'done')
+            ? 'installed'
+            : did('browser', 'skipped')
+              ? 'download_skipped'
+              : snapshot.browser?.found
+                ? 'already_installed'
+                : 'skipped',
+        }
+      case 'judge':
+        return {
+          outcome: did('judge', 'done')
+            ? 'set_up'
+            : judges.length > 0
+              ? 'continued'
+              : 'skipped',
+          judges: judges.map((option) => option.id),
+        }
+      default:
+        return {}
+    }
+  }
+  const lastStep = useRef<WizardStepId>(step)
+  useEffect(() => {
+    const previous = lastStep.current
+    lastStep.current = step
+    const order = stepIds.split(',')
+    if (previous !== step && order.indexOf(step) > order.indexOf(previous)) {
+      reportRef.current(previous as SetupStepId, outcomeRef.current(previous))
+      if (step === 'ready') {
+        reportRef.current('ready', {
+          providers: outcomeRef.current('models').providers ?? [],
+          judges: outcomeRef.current('judge').judges ?? [],
+        })
+      }
+    }
+    stepStartedAt.current = Date.now()
+  }, [step, stepIds])
+
   const go = useCallback((next: WizardStepId) => {
     if (next === 'browser') setBrowserListed(true)
     setStep(next)
@@ -215,8 +308,9 @@ export function OnboardingWizardHost() {
   const close = useCallback(() => {
     setOpen(false)
     if (step === 'ready') return
+    report('closed', { at_step: step })
     record('dismissed')
-  }, [record, step])
+  }, [record, report, step])
 
   const finishTo = useCallback(
     (judgeChoices: JudgeOption[]) => {
@@ -259,9 +353,10 @@ export function OnboardingWizardHost() {
   )
 
   const start = useCallback(() => {
+    report('finish', { outcome: 'start_building' })
     setOpen(false)
     window.requestAnimationFrame(requestComposerFocus)
-  }, [])
+  }, [report])
 
   // Ready reads the project's example prompts, and the agent profiles they
   // name, each time it shows: the project's file may have changed since.
@@ -312,6 +407,7 @@ export function OnboardingWizardHost() {
     async (prompt: ExamplePrompt) => {
       if (starting.current) return
       starting.current = true
+      reportRef.current('finish', { outcome: 'example_prompt' })
       setOpen(false)
       const [profiles, workingDir] = await Promise.all([
         // Profiles still loading (a quick click): ask for them once more.
@@ -346,6 +442,7 @@ export function OnboardingWizardHost() {
       return
     }
     setTour({ kind: 'idle' })
+    reportRef.current('finish', { outcome: 'tour' })
     setOpen(false)
     requestPanelOpen({ pageId: TOUR_PAGE })
   }, [])
@@ -377,7 +474,7 @@ export function OnboardingWizardHost() {
           }}
         >
           <DialogContent
-            className="@container flex h-[min(780px,calc(100dvh-32px))] max-h-none w-[min(760px,calc(100vw-32px))] max-w-none flex-row overflow-hidden rounded-xl border border-neutral-200 bg-white p-0 font-sans text-sm font-normal leading-normal tracking-normal text-ink shadow-floating dark:border-neutral-800 dark:bg-neutral-950 [&>button:last-child]:hidden"
+            className="@container flex h-[min(720px,calc(100dvh-32px))] max-h-none w-[min(836px,calc(100vw-32px))] max-w-none flex-row overflow-hidden rounded-xl border border-neutral-200 bg-white p-0 font-sans text-sm font-normal leading-normal tracking-normal text-ink shadow-floating dark:border-neutral-800 dark:bg-neutral-950 [&>button:last-child]:hidden"
             onOpenAutoFocus={(event) => {
               // Land on the step's primary action, not the first button in it.
               event.preventDefault()
@@ -439,6 +536,7 @@ export function OnboardingWizardHost() {
                   <WelcomeStep
                     onStart={() => go('models')}
                     onSkip={() => {
+                      report('welcome', { outcome: 'skipped_setup' })
                       setOpen(false)
                       record('dismissed')
                     }}
