@@ -288,7 +288,9 @@ export function DeviceSignIn({
             }
             className={cn(
               'group flex h-12 items-center justify-between gap-3 rounded-md border bg-panel-raised pr-2 pl-4 text-left transition-[border-color,background-color] duration-150 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-rule-focus',
-              copied ? 'border-ok/50' : 'border-edge hover:border-rule-strong',
+              copied
+                ? 'border-ok/50'
+                : 'border-edge hover:border-neutral-400 dark:hover:border-neutral-600',
             )}
           >
             <span className="select-all font-mono text-[18px] font-semibold tracking-[0.18em] text-ink">
@@ -317,7 +319,7 @@ export function DeviceSignIn({
               href={code.verification_uri}
               target="_blank"
               rel="noopener noreferrer"
-              className="font-medium text-ink underline decoration-rule-strong underline-offset-2 hover:decoration-ink"
+              className="font-medium text-ink underline decoration-neutral-400 underline-offset-2 hover:decoration-ink dark:decoration-neutral-600"
             >
               {pageLabel(code.verification_uri)}
             </a>
