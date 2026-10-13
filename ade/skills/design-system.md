@@ -39,7 +39,7 @@ annotations) is documented in `ade/web/README.md`, not here.
 
 ## Setup dialog
 
-Setup is a 760×620px dialog (`rounded-xl`, 1px neutral frame, `shadow-floating`):
+Setup is a 760px-wide dialog up to 780px tall (`rounded-xl`, 1px neutral frame, `shadow-floating`):
 a 200px `neutral-50` rail on the left with the wordmark and a vertical stepper,
 then a scrolling body over a 56px footer with the step's actions. The stepper
 (`Stepper.tsx`) is 24px numbered dots joined by a hairline that fills as steps

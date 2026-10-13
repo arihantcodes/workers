@@ -63,6 +63,7 @@ function controller(
     activity,
     running: null,
     run: async () => true,
+    skipStep: () => undefined,
     judgeInstalled: installed.has('judge'),
     checkChromium: async () => null,
     installChromium: async () => ({ ok: true as const }),
@@ -111,13 +112,15 @@ describe('ModelsStep', () => {
     expect(html).toContain('Subscriptions')
     expect(html).toContain('Sign-in at')
     expect(html).toContain('~/.claude/.credentials.json')
-    // Installed but not signed in: in its place, saying why and how.
+    // Installed but not signed in: in its place, saying why. Optional: the
+    // commands wait until it is ticked (see ModelsStep.interaction.test).
     expect(html).toContain('Not signed in')
     expect(html).toContain('not a ChatGPT account')
-    expect(html).toContain('codex login')
+    expect(html).toContain('aria-label="Connect Codex"')
+    expect(html).not.toContain('codex login')
   })
 
-  it('shows how to install and sign in to a coding agent that is missing', () => {
+  it('keeps a missing coding agent and the GitHub sign-in folded until ticked', () => {
     const html = renderToStaticMarkup(
       <ModelsStep
         onboarding={controller({ tools: [] })}
@@ -126,8 +129,10 @@ describe('ModelsStep', () => {
       />,
     )
     expect(html).toContain('Not installed')
-    expect(html).toContain('npm install -g @anthropic-ai/claude-code')
-    expect(html).toContain('then type /login')
+    expect(html).toContain('aria-label="Connect Claude Code"')
+    expect(html).not.toContain('npm install -g @anthropic-ai/claude-code')
+    expect(html).toContain('aria-label="Connect GitHub Copilot"')
+    expect(html).not.toContain('GitHub Copilot sign-in')
   })
 
   it('keeps a connected provider in its place, checked, with its models', () => {
@@ -358,7 +363,8 @@ describe('ReadyStep', () => {
     expect(html).toContain('Build an expense tracker')
     expect(html).toContain('Create a test reviewer agent')
     expect(html).toContain('Explain this project')
-    expect(html).toContain('Create an app or tool')
+    // Each card names the agent profile it runs with, as the gallery does.
+    expect(html).toContain('>Onboarding<')
     expect(html).toContain('>Default<')
     // The message itself waits for the click; the card never shows it.
     expect(html).not.toContain('link-shortener')

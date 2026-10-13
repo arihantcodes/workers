@@ -3,6 +3,7 @@ import {
   checkProviderKey,
   composeEventProgress,
   judgeFunctionsSignature,
+  projectFileFor,
   runStep,
   type StepProgress,
 } from './api'
@@ -383,7 +384,7 @@ describe('runStep add-workers', () => {
     const done = start()
     await settle()
     expect(report).toHaveBeenLastCalledWith({
-      note: 'waiting for judge to connect',
+      note: 'Waiting for judge to connect',
     })
     expect(live('engine::workers-available')).toHaveLength(1)
     const lists = order.filter((entry) => entry === 'engine::workers::list')
@@ -759,5 +760,39 @@ describe('runStep add-workers: the compose file', () => {
     )?.[1]
     expect(payload).toMatchObject({ workers: ['provider-claude-code'] })
     expect(payload).not.toHaveProperty('file')
+  })
+})
+
+describe('projectFileFor', () => {
+  const list = {
+    projects: [
+      {
+        file: '/work/other/worker-compose.yaml',
+        containers: [{ container: 'todo' }],
+      },
+      {
+        file: '/work/harness/worker-compose.yaml',
+        containers: [{ container: 'llm-router' }, { container: 'onboarding' }],
+      },
+    ],
+  }
+
+  it('picks the loaded project that runs the worker, not the first one', () => {
+    expect(projectFileFor(list, ['onboarding'])).toBe(
+      '/work/harness/worker-compose.yaml',
+    )
+    expect(projectFileFor(list, ['llm-router'])).toBe(
+      '/work/harness/worker-compose.yaml',
+    )
+  })
+
+  it('falls back to the first project with a file, then to none', () => {
+    expect(projectFileFor(list, ['nowhere'])).toBe(
+      '/work/other/worker-compose.yaml',
+    )
+    expect(projectFileFor({ projects: [{ containers: [] }] }, ['x'])).toBe(
+      undefined,
+    )
+    expect(projectFileFor(null, ['x'])).toBe(undefined)
   })
 })

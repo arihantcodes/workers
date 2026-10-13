@@ -653,8 +653,14 @@ function RemoveOnboarding({ host, onClose }: { host: Host; onClose?: () => void 
     setRemoving(true)
     setError(null)
     try {
-      const list = await host.iii.trigger<{ projects?: { file?: string }[] }>('compose::list', {}).catch(() => null)
-      const file = list?.projects?.find((project) => project.file)?.file
+      const list = await host.iii
+        .trigger<{ projects?: { file?: string; containers?: { container?: string }[] }[] }>('compose::list', {})
+        .catch(() => null)
+      // With several projects loaded, the one running this worker.
+      const withFile = (list?.projects ?? []).filter((project) => project.file)
+      const file = (
+        withFile.find((project) => project.containers?.some((entry) => entry.container === 'onboarding')) ?? withFile[0]
+      )?.file
       await host.iii.trigger('compose::remove', {
         ...(file ? { file } : {}),
         workers: ['onboarding'],

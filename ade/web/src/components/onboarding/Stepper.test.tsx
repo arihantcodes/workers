@@ -56,4 +56,19 @@ describe('Stepper', () => {
     expect(html).toMatch(/aria-current="step"[\s\S]*Ready<[^>]*>, completed/)
     expect(html.match(/, completed/g)).toHaveLength(4)
   })
+
+  it('keeps every horizontal step named for screen readers when labels fold', () => {
+    const html = renderToStaticMarkup(
+      <Stepper
+        steps={STEPS}
+        current="judge"
+        reachable={new Set(['welcome', 'models'])}
+        onSelect={noop}
+      />,
+    )
+    // Folded below @md visually only: never display:none.
+    expect(html).not.toMatch(/class="[^"]*\bhidden\b[^"]*@md:flex/)
+    expect(html).toContain('sr-only @md:not-sr-only @md:flex')
+    expect(html).toMatch(/Welcome<[^>]*>, completed/)
+  })
 })

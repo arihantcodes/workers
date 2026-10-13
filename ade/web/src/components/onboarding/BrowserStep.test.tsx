@@ -67,6 +67,7 @@ function controller(
     activity: [],
     running: null,
     run: async () => true,
+    skipStep: () => undefined,
     judgeInstalled: false,
     checkChromium: async () => null,
     installChromium: async () => ({ ok: true }),

@@ -328,7 +328,7 @@ function KeyOption({
         {label}
       </span>
       {meta ? (
-        <span className="shrink-0 font-mono text-[11px] text-ink-faint">
+        <span className="shrink-0 font-mono text-[12px] text-ink-faint">
           {meta}
         </span>
       ) : null}

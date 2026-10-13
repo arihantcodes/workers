@@ -5,6 +5,7 @@ import {
   CircleAlert,
   Copy,
   LoaderCircle,
+  SkipForward,
 } from 'lucide-react'
 import { useReducedMotion } from 'motion/react'
 import type * as React from 'react'
@@ -22,7 +23,8 @@ import {
   keyStore,
 } from '@/lib/secrets'
 import { cn } from '@/lib/utils'
-import type { ActivityEntry } from './use-onboarding'
+import { Button } from './controls'
+import { type ActivityEntry, SLOW_STEP_MS } from './use-onboarding'
 
 /** Where a step sits among the setup steps (Welcome and Ready not counted). */
 export interface StepPosition {
@@ -151,7 +153,7 @@ export function StatusChip({
   return (
     <span
       data-tone={tone}
-      className="inline-flex h-5 shrink-0 items-center gap-1.5 whitespace-nowrap rounded-full border border-neutral-200 bg-neutral-50 px-2 font-sans text-[11px] font-medium leading-none text-neutral-600 dark:border-neutral-800 dark:bg-neutral-900 dark:text-neutral-300"
+      className="inline-flex h-5 shrink-0 items-center gap-1.5 whitespace-nowrap rounded-full border border-neutral-200 bg-neutral-50 px-2 font-sans text-[12px] font-medium leading-none text-neutral-600 dark:border-neutral-800 dark:bg-neutral-900 dark:text-neutral-300"
     >
       {tone === 'ok' || tone === 'warn' ? (
         <span
@@ -243,11 +245,14 @@ export function EngineLog({
   plan,
   entries,
   running,
+  onSkip,
 }: {
   /** Operations the primary action will run, not started yet. */
   plan: readonly PlanStep[]
   entries: readonly ActivityEntry[]
   running: boolean
+  /** "Skip for now" on a step past `SLOW_STEP_MS`; omitted, none is offered. */
+  onSkip?: () => void
 }) {
   const reduceMotion = useReducedMotion()
   const last = entries[entries.length - 1]
@@ -267,7 +272,9 @@ export function EngineLog({
     })
   }, [moving, open, reduceMotion])
   const queued = running ? [] : plan
+  const now = useNow(running)
   if (entries.length === 0 && queued.length === 0) return null
+  const current = running && last?.status === 'running' ? last : null
 
   const doneCount = entries.filter((entry) => entry.status === 'done').length
   const summary =
@@ -295,69 +302,80 @@ export function EngineLog({
     )
 
   return (
-    <Disclosure
-      label="Engine log"
-      summary={summary}
-      open={open}
-      onOpenChange={setOpen}
-    >
-      <ol
-        ref={list}
-        role="log"
-        aria-live="polite"
-        aria-label="Engine log"
-        className={cn(TERMINAL_SURFACE, 'gap-3 text-[13px] leading-5')}
+    <div className="flex flex-col gap-2">
+      {/* Outside the folded (inert) log, so progress is announced while it
+          is shut; no seconds in it, or it would speak every second. */}
+      <span role="status" aria-live="polite" className="sr-only">
+        {announcement(last, running, doneCount)}
+      </span>
+      {current ? (
+        <RunningLine entry={current} now={now} onSkip={onSkip} />
+      ) : null}
+      <Disclosure
+        label="Engine log"
+        summary={summary}
+        open={open}
+        onOpenChange={setOpen}
       >
-        {entries.map((entry) => (
-          <li key={entry.id} className="flex gap-2.5">
-            <LogGlyph status={entry.status} terminal />
-            <LogLine
-              title={entry.title}
-              command={entry.detail}
-              tone={entry.status === 'failed' ? 'failed' : 'ink'}
-              trailing={
-                typeof entry.progress === 'number'
-                  ? `${Math.round(entry.progress * 100)}%`
-                  : undefined
-              }
-            >
-              {entry.note ? (
-                <span
-                  className={cn(
-                    'break-words',
-                    entry.status === 'failed'
-                      ? 'text-rose-700 dark:text-rose-300'
-                      : 'text-neutral-600 dark:text-neutral-400',
-                  )}
-                >
-                  {entry.status === 'failed' ? '✗ ' : '→ '}
-                  {entry.note}
-                </span>
-              ) : null}
-            </LogLine>
-          </li>
-        ))}
-        {queued.map((step, index) => {
-          const title = describeStep(step)
-          const detail = stepDetail(step)
-          return (
-            // biome-ignore lint/suspicious/noArrayIndexKey: a plan is rebuilt whole; its order is its identity
-            <li key={`queued-${index}`} className="flex gap-2.5">
-              <LogGlyph status="queued" terminal />
-              <LogLine title={title} command={detail} tone="queued">
-                {step.kind === 'add-workers'
-                  ? step.workers.map((worker) => (
-                      <span key={worker} className="text-neutral-500">
-                        # {worker}: {step.why[worker]}
-                      </span>
-                    ))
-                  : null}
+        <ol
+          ref={list}
+          aria-label="Engine log"
+          className={cn(TERMINAL_SURFACE, 'gap-3 text-[13px] leading-5')}
+        >
+          {entries.map((entry) => (
+            <li key={entry.id} className="flex gap-2.5">
+              <LogGlyph status={entry.status} terminal />
+              <LogLine
+                title={entry.title}
+                command={entry.detail}
+                tone={entry.status === 'failed' ? 'failed' : 'ink'}
+                trailing={
+                  typeof entry.progress === 'number'
+                    ? `${Math.round(entry.progress * 100)}%`
+                    : undefined
+                }
+              >
+                {entry.note ? (
+                  <span
+                    className={cn(
+                      'break-words',
+                      entry.status === 'failed'
+                        ? 'text-rose-700 dark:text-rose-300'
+                        : 'text-neutral-600 dark:text-neutral-400',
+                    )}
+                  >
+                    {entry.status === 'failed' ? '✗ ' : '→ '}
+                    {entry.note}
+                    {entry.status === 'running'
+                      ? ` (${seconds(now, entry.noteAt ?? entry.startedAt)})`
+                      : null}
+                  </span>
+                ) : null}
               </LogLine>
             </li>
-          )
-        })}
-      </ol>
-    </Disclosure>
+          ))}
+          {queued.map((step, index) => {
+            const title = describeStep(step)
+            const detail = stepDetail(step)
+            return (
+              // biome-ignore lint/suspicious/noArrayIndexKey: a plan is rebuilt whole; its order is its identity
+              <li key={`queued-${index}`} className="flex gap-2.5">
+                <LogGlyph status="queued" terminal />
+                <LogLine title={title} command={detail} tone="queued">
+                  {step.kind === 'add-workers'
+                    ? step.workers.map((worker) => (
+                        <span key={worker} className="text-neutral-500">
+                          # {worker}: {step.why[worker]}
+                        </span>
+                      ))
+                    : null}
+                </LogLine>
+              </li>
+            )
+          })}
+        </ol>
+      </Disclosure>
+    </div>
   )
 }
 
@@ -410,6 +428,147 @@ function LogLine({
  * The status mark: theme ink on the disclosure row, fixed colours on the
  * terminal surface (`terminal`), which is dark in both themes.
  */
+/** The time now, once a second while `active`; frozen otherwise. */
+export function useNow(active: boolean): number {
+  const [now, setNow] = useState(() => Date.now())
+  useEffect(() => {
+    if (!active) return
+    setNow(Date.now())
+    const timer = window.setInterval(() => setNow(Date.now()), 1_000)
+    return () => window.clearInterval(timer)
+  }, [active])
+  return now
+}
+
+/** What the live region says about the latest step: one line, no timer. */
+function announcement(
+  last: ActivityEntry | undefined,
+  running: boolean,
+  doneCount: number,
+): string {
+  if (!last) return ''
+  if (last.status === 'running') {
+    return running ? `${last.title}: ${last.note ?? 'in progress'}` : ''
+  }
+  if (last.status === 'failed') {
+    return `${last.title} failed${last.note ? `: ${last.note}` : ''}`
+  }
+  if (last.status === 'skipped') return `${last.title} skipped`
+  return running ? `${last.title} done` : `${doneCount} done`
+}
+
+/** Whole seconds since `since`, as the CLI counts them: `12s`, `1m 05s`. */
+export function seconds(now: number, since: number | undefined): string {
+  const total = Math.max(0, Math.floor((now - (since ?? now)) / 1_000))
+  if (total < 60) return `${total}s`
+  const minutes = Math.floor(total / 60)
+  return `${minutes}m ${String(total % 60).padStart(2, '0')}s`
+}
+
+/**
+ * The step running now, said the way the CLI says it — what it waits on and
+ * for how long — in one card with the setup's other cards. Past
+ * `SLOW_STEP_MS` the card opens a second row offering "Skip for now".
+ */
+function RunningLine({
+  entry,
+  now,
+  onSkip,
+}: {
+  entry: ActivityEntry
+  now: number
+  onSkip?: () => void
+}) {
+  const slow =
+    onSkip !== undefined &&
+    entry.startedAt !== undefined &&
+    now - entry.startedAt >= SLOW_STEP_MS
+  return (
+    <div className={CARD}>
+      <p className="flex min-w-0 items-center gap-2.5 px-3.5 py-2.5 font-sans text-[13px] leading-5 text-ink">
+        <LoaderCircle
+          strokeWidth={1.5}
+          className="size-4 shrink-0 animate-spin text-neutral-500 motion-reduce:animate-none dark:text-neutral-400"
+          aria-hidden
+        />
+        <span className="min-w-0 truncate">
+          {entry.note ?? entry.title}{' '}
+          <span className="font-mono text-[12px] tabular-nums text-neutral-500 dark:text-neutral-400">
+            ({seconds(now, entry.noteAt ?? entry.startedAt)})
+          </span>
+        </span>
+      </p>
+      {/* Opens by its grid track, so it can reverse midway; inert while shut. */}
+      <div
+        inert={!slow}
+        className={cn(
+          'grid transition-[grid-template-rows,opacity] duration-200 ease-[cubic-bezier(0.2,0,0,1)] motion-reduce:transition-none',
+          slow ? 'grid-rows-[1fr] opacity-100' : 'grid-rows-[0fr] opacity-0',
+        )}
+      >
+        <div className="min-h-0 overflow-hidden">
+          {onSkip ? (
+            <SlowRow
+              onSkip={onSkip}
+              className="border-t border-neutral-200 dark:border-neutral-800"
+            />
+          ) : null}
+        </div>
+      </div>
+    </div>
+  )
+}
+
+/** The setup's card surface: the same frame `Rows` draws. */
+const CARD =
+  'flex flex-col overflow-hidden rounded-lg border border-neutral-200 bg-white dark:border-neutral-800 dark:bg-neutral-950'
+
+/**
+ * A step past `SLOW_STEP_MS`, on its own card (the Browser step's download).
+ * Skipping ends only this step; what it asked of the engine may still finish.
+ */
+export function SlowStepNotice({ onSkip }: { onSkip: () => void }) {
+  return (
+    <div role="status" className={CARD}>
+      <SlowRow onSkip={onSkip} />
+    </div>
+  )
+}
+
+function SlowRow({
+  onSkip,
+  className,
+}: {
+  onSkip: () => void
+  className?: string
+}) {
+  return (
+    <div
+      className={cn(
+        'flex items-center gap-3 px-3.5 py-2.5 font-sans text-[13px] leading-5',
+        className,
+      )}
+    >
+      {/* The setup's one attention mark: the dot "Not signed in" carries. */}
+      <span
+        aria-hidden
+        className="flex h-5 w-4 shrink-0 items-center justify-center self-start"
+      >
+        <span className="size-1.5 rounded-full bg-warn" />
+      </span>
+      <span className="flex min-w-0 flex-1 flex-col">
+        <span className="font-medium text-ink">Taking longer than usual</span>
+        <span className="text-pretty text-neutral-600 dark:text-neutral-400">
+          Skip to carry on. It can finish in the background.
+        </span>
+      </span>
+      <Button variant="outline" size="sm" onClick={onSkip}>
+        Skip for now
+      </Button>
+    </div>
+  )
+}
+
 function LogGlyph({
   status,
   terminal = false,
@@ -438,6 +597,14 @@ function LogGlyph({
           className,
           terminal ? 'text-rose-700 dark:text-rose-400' : 'text-alert',
         )}
+      />
+    )
+  }
+  if (status === 'skipped') {
+    return (
+      <SkipForward
+        aria-label="skipped"
+        className={cn(className, 'p-px text-neutral-500 dark:text-neutral-400')}
       />
     )
   }
@@ -530,7 +697,7 @@ export function CommandLine({
   }
   const [program, ...rest] = command.split(' ')
   return (
-    <div className="flex min-w-0 items-center gap-3 h-4">
+    <div className="flex min-w-0 items-center gap-3">
       <code className="min-w-0 flex-1 truncate">
         <span aria-hidden className="select-none text-neutral-500">
           ${' '}
@@ -558,6 +725,14 @@ export function CommandLine({
           </span>
         ) : null}
       </code>
+      {copied ? (
+        <span
+          aria-hidden
+          className="shrink-0 font-sans text-[12px] font-medium text-emerald-700 dark:text-emerald-400"
+        >
+          Copied
+        </span>
+      ) : null}
       <button
         type="button"
         onClick={copy}
@@ -625,7 +800,7 @@ export function KeyField({
         stores={stores}
         envFile={envFile}
       />
-      <p className="font-sans text-xs leading-4 text-neutral-500 dark:text-neutral-400">
+      <p className="font-sans text-[13px] leading-5 text-neutral-500 dark:text-neutral-400">
         {keyStore(value ?? defaultKeyInput(detection)) === 'env'
           ? `Kept in this project's ${envFile ?? DEFAULT_ENV_FILE} file.`
           : 'Stored encrypted on this machine. It never lands in a file you commit.'}

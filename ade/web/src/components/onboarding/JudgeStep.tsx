@@ -104,11 +104,12 @@ export function JudgeStep({
       option.envVar !== undefined && !installed(option) && !keyInputReady(key),
   )
 
+  // Once the strategies are set up, setup moves on; a failure stays here.
   const apply = async () => {
-    if (await run('judge', plan)) {
-      setDrafts(new Map())
-      setKeys(new Map())
-    }
+    if (!(await run('judge', plan))) return
+    setDrafts(new Map())
+    setKeys(new Map())
+    onNext(ordered)
   }
 
   return (
@@ -180,7 +181,7 @@ export function JudgeStep({
                   <span className="text-[13px] font-medium leading-5 text-ink">
                     {use.where}
                   </span>
-                  <span className="text-pretty text-xs leading-4 text-neutral-600 dark:text-neutral-400">
+                  <span className="text-pretty text-[13px] leading-5 text-neutral-600 dark:text-neutral-400">
                     {use.short}
                   </span>
                 </span>
@@ -188,7 +189,7 @@ export function JudgeStep({
             )
           })}
         </ul>
-        <p className="border-t border-neutral-200 px-3.5 py-2 text-xs leading-4 text-neutral-500 dark:border-neutral-800 dark:text-neutral-400">
+        <p className="border-t border-neutral-200 px-3.5 py-2 text-[13px] leading-5 text-neutral-500 dark:border-neutral-800 dark:text-neutral-400">
           Without Judge, function search falls back to keyword matching and a
           broken tool call goes back to the main model.
         </p>
@@ -240,7 +241,12 @@ export function JudgeStep({
         </div>
       </Section>
 
-      <EngineLog plan={plan} entries={log} running={running === 'judge'} />
+      <EngineLog
+        plan={plan}
+        entries={log}
+        running={running === 'judge'}
+        onSkip={onboarding.skipStep}
+      />
     </StepLayout>
   )
 }

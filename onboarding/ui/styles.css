@@ -233,7 +233,7 @@
   border-radius: var(--radius-full);
   background: var(--color-panel-raised);
   color: var(--color-ink-ghost);
-  font-size: 11px;
+  font-size: 0.75rem;
   font-weight: 600;
   font-variant-numeric: tabular-nums;
   transition:
@@ -303,7 +303,7 @@
   border-radius: var(--radius-full);
   background: var(--color-surface);
   color: var(--color-ink-faint);
-  font-size: 11px;
+  font-size: 0.75rem;
   font-weight: 500;
   line-height: 1;
   white-space: nowrap;

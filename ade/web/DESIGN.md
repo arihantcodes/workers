@@ -16,7 +16,8 @@ and `@import "tailwindcss"` in `src/index.css`. Add utilities directly in JSX;
 shared colors, fonts, and motion values come from the CSS `@theme` tokens.
 
 Setup is styled entirely with Tailwind utilities in its components, using
-Inter, a 14px body/12px caption scale, and the neutral color palette. The
+Geist (Inter fallback), a 13–14px body with 12px as the smallest size, and the
+neutral color palette. The
 `dark` variant follows the application’s `data-theme` attribute. Provider marks reuse the worker SVG
 assets through `ProviderMark`. Step transitions use Motion (`motion/react`),
 with `MotionConfig` and `useReducedMotion` honoring the system preference.

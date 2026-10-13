@@ -257,16 +257,12 @@ export interface Pillar {
   line: string
 }
 
+/** In CODER order: Composable, Observable, Discoverable, Extensible, Reactive. */
 export const PILLARS: readonly Pillar[] = [
   {
-    id: 'extensible',
-    title: 'Extensible',
-    line: 'Your agent builds the tools it needs, from kanban boards to UI previews.',
-  },
-  {
-    id: 'discoverable',
-    title: 'Discoverable',
-    line: 'Every function in your backend is a tool your agent can find and use.',
+    id: 'composable',
+    title: 'Composable',
+    line: 'Add ready-made workers from the registry at workers.iii.dev.',
   },
   {
     id: 'observable',
@@ -274,9 +270,14 @@ export const PILLARS: readonly Pillar[] = [
     line: 'Follow every model turn, function call, and trigger in one place.',
   },
   {
-    id: 'composable',
-    title: 'Composable',
-    line: 'Add ready-made workers from the registry at workers.iii.dev.',
+    id: 'discoverable',
+    title: 'Discoverable',
+    line: 'Every function in your backend is a tool your agent can find and use.',
+  },
+  {
+    id: 'extensible',
+    title: 'Extensible',
+    line: 'Your agent builds the tools it needs, from kanban boards to UI previews.',
   },
   {
     id: 'reactive',

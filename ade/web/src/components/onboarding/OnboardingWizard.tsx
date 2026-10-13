@@ -210,12 +210,13 @@ export function OnboardingWizardHost() {
     void saveOnboardingState(next, summary).catch(() => undefined)
   }, [])
 
+  // Closable at any point, a running step included: the run carries on
+  // without the dialog (see `useOnboarding`).
   const close = useCallback(() => {
-    if (busy) return
     setOpen(false)
     if (step === 'ready') return
     record('dismissed')
-  }, [busy, record, step])
+  }, [record, step])
 
   const finishTo = useCallback(
     (judgeChoices: JudgeOption[]) => {
@@ -376,14 +377,11 @@ export function OnboardingWizardHost() {
           }}
         >
           <DialogContent
-            className="@container flex h-[min(620px,calc(100dvh-32px))] max-h-none w-[min(760px,calc(100vw-32px))] max-w-none flex-row overflow-hidden rounded-xl border border-neutral-200 bg-white p-0 font-sans text-sm font-normal leading-normal tracking-normal text-ink shadow-floating dark:border-neutral-800 dark:bg-neutral-950 [&>button:last-child]:hidden"
+            className="@container flex h-[min(780px,calc(100dvh-32px))] max-h-none w-[min(760px,calc(100vw-32px))] max-w-none flex-row overflow-hidden rounded-xl border border-neutral-200 bg-white p-0 font-sans text-sm font-normal leading-normal tracking-normal text-ink shadow-floating dark:border-neutral-800 dark:bg-neutral-950 [&>button:last-child]:hidden"
             onOpenAutoFocus={(event) => {
               // Land on the step's primary action, not the first button in it.
               event.preventDefault()
               focusPrimary(event.currentTarget)
-            }}
-            onEscapeKeyDown={(event) => {
-              if (busy) event.preventDefault()
             }}
             onPointerDownOutside={(event) => event.preventDefault()}
             onInteractOutside={(event) => event.preventDefault()}

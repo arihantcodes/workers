@@ -1,6 +1,6 @@
 import { LoaderCircle } from 'lucide-react'
 import type * as React from 'react'
-import { useEffect, useId, useMemo, useState } from 'react'
+import { useEffect, useId, useMemo, useRef, useState } from 'react'
 import { DeviceSignIn } from '@/components/chat/DeviceSignIn'
 import { Skeleton } from '@/components/ui/Skeleton'
 import { KEY_PROVIDERS, SUBSCRIPTION_PROVIDERS } from '@/lib/onboarding/catalog'
@@ -115,9 +115,16 @@ export function ModelsStep({
     ...extra,
   ]
 
-  // Connected choices start checked, and recommended ones until the first
-  // provider is connected; the user's own clicks win after.
-  const nothingConnected = !choices.some((choice) => choice.ready)
+  // Connected choices start checked, and recommended ones when nothing was
+  // connected as the step opened; the user's own clicks win after. Read once,
+  // at the first scan: a provider connecting from here (GitHub Copilot's
+  // sign-in) must not uncheck the recommended ones still waiting.
+  const nothingConnectedNow = !choices.some((choice) => choice.ready)
+  const startedEmpty = useRef<boolean | null>(null)
+  if (startedEmpty.current === null && snapshot.tools !== null) {
+    startedEmpty.current = nothingConnectedNow
+  }
+  const nothingConnected = startedEmpty.current ?? nothingConnectedNow
   const draftFor = (choice: ProviderChoice): Draft =>
     resolveDraft(drafts.get(choice.providerId), {
       selected: choice.ready || preselected(choice, nothingConnected),
@@ -136,8 +143,13 @@ export function ModelsStep({
       choice.detection !== null &&
       (choice.detection.stored || choice.detection.sources.length > 0),
   )
+  // A ticked provider still waiting on its sign-in joins the plan once a
+  // scan finds it signed in; until then its row shows how.
   const selections: ProviderSelection[] = all
-    .filter((choice) => !choice.ready && draftFor(choice).selected)
+    .filter(
+      (choice) =>
+        !choice.ready && draftFor(choice).selected && !awaitingSignIn(choice),
+    )
     .map((choice) => ({ choice, key: draftFor(choice).key }))
   const removals = all.filter(
     (choice) => choice.ready && !draftFor(choice).selected,
@@ -160,8 +172,11 @@ export function ModelsStep({
     key?: KeyInput
   }[]
 
+  // Once the changes land, setup moves on; a failure stays here with its log.
   const apply = async () => {
-    if (await run('models', plan)) setDrafts(draftsAfterConnect(drafts))
+    if (!(await run('models', plan))) return
+    setDrafts(draftsAfterConnect(drafts))
+    onNext()
   }
 
   const renderTile = (choice: ProviderChoice) => (
@@ -253,7 +268,7 @@ export function ModelsStep({
                     key={choice.providerId}
                     choice={choice}
                     selected={draftFor(choice).selected}
-                    disabled={busy || !usable(choice)}
+                    disabled={busy}
                     onToggle={(selected) => update(choice, { selected })}
                     scanning={scanning}
                     onScan={() => void refresh()}
@@ -316,7 +331,7 @@ export function ModelsStep({
                     className="size-4 text-ink"
                   />
                   {choice.title} key
-                  <span className="ml-auto font-mono text-[11px] font-normal text-neutral-500 dark:text-neutral-400">
+                  <span className="ml-auto font-mono text-[12px] font-normal text-neutral-500 dark:text-neutral-400">
                     {choice.provider.envVar}
                   </span>
                 </span>
@@ -347,7 +362,12 @@ export function ModelsStep({
         </>
       )}
 
-      <EngineLog plan={plan} entries={log} running={running === 'models'} />
+      <EngineLog
+        plan={plan}
+        entries={log}
+        running={running === 'models'}
+        onSkip={onboarding.skipStep}
+      />
     </StepLayout>
   )
 }
@@ -387,8 +407,9 @@ export function preselected(
 }
 
 /**
- * A provider that signs in from here with a device code (GitHub Copilot):
- * the sign-in stands where the checkbox goes until it lands.
+ * A provider that signs in from here with a device code (GitHub Copilot).
+ * Optional: ticking it opens the sign-in below the row, unticking closes it
+ * (and stops asking GitHub). Once signed in it is an ordinary checked row.
  */
 function DeviceRow({
   choice,
@@ -408,7 +429,7 @@ function DeviceRow({
     <div
       className={cn(
         'flex flex-col gap-1 px-3.5 py-2.5 transition-colors duration-150 ease-[var(--motion-ease-standard)]',
-        selected && choice.ready && 'bg-neutral-100 dark:bg-neutral-900',
+        selected && 'bg-neutral-100 dark:bg-neutral-900',
       )}
     >
       <div className="flex items-start gap-3">
@@ -421,7 +442,7 @@ function DeviceRow({
           htmlFor={id}
           className={cn(
             'flex min-w-0 flex-1 flex-col gap-px',
-            !disabled && choice.ready && 'cursor-pointer',
+            !disabled && 'cursor-pointer',
           )}
         >
           <span className="font-sans text-[13px] font-medium leading-5 text-ink">
@@ -433,22 +454,21 @@ function DeviceRow({
         </label>
         <span className="flex h-5 items-center gap-3">
           <ChoiceStatus choice={choice} selected={selected} />
-          {choice.ready ? (
-            <Checkbox
-              id={id}
-              aria-label={`Connect ${choice.title}`}
-              checked={selected}
-              disabled={disabled}
-              onChange={(event) => onToggle(event.currentTarget.checked)}
-            />
-          ) : null}
+          <Checkbox
+            id={id}
+            aria-label={`Connect ${choice.title}`}
+            checked={selected}
+            disabled={disabled}
+            onChange={(event) => onToggle(event.currentTarget.checked)}
+          />
         </span>
       </div>
-      {choice.ready ? null : (
+      {choice.ready || !selected ? null : (
         <div className="pl-7">
           <DeviceSignIn
             provider={choice.provider}
             installed={choice.installed}
+            heading={false}
             onConnected={onConnected}
           />
         </div>
@@ -616,7 +636,8 @@ function SubscriptionRow({
           />
         </span>
       </div>
-      {needsSetup ? (
+      {/* Ticked but not signed in: the commands that get it there. */}
+      {needsSetup && selected ? (
         <div className="mt-1.5 flex flex-col gap-1.5 pl-7">
           <Terminal>
             {!tool?.installed ? (
@@ -625,9 +646,9 @@ function SubscriptionRow({
             <CommandLine command={provider.signIn} note={provider.signInNote} />
           </Terminal>
           <span className="flex min-h-7 flex-wrap items-center justify-between gap-x-3 gap-y-1 pl-1">
-            <span className="font-sans text-xs text-neutral-500 dark:text-neutral-400">
+            <span className="font-sans text-[13px] text-neutral-500 dark:text-neutral-400">
               Run {tool?.installed ? 'this' : 'these'} in a terminal, then scan
-              again.
+              again. {choice.title} connects once it is signed in.
             </span>
             <ScanButton scanning={scanning} onScan={onScan} />
           </span>
@@ -666,6 +687,16 @@ function catalogOrder(choices: ProviderChoice[]): ProviderChoice[] {
   const index = (choice: ProviderChoice) =>
     CATALOG_ORDER.get(choice.worker) ?? CATALOG_ORDER.size
   return [...choices].sort((a, b) => index(a) - index(b))
+}
+
+/**
+ * Ticked, but nothing to connect yet: a coding agent not signed in on this
+ * machine, or a device sign-in that has not landed.
+ */
+function awaitingSignIn(choice: ProviderChoice): boolean {
+  if (choice.ready) return false
+  if (choice.kind === 'device') return true
+  return choice.kind === 'subscription' && !choice.usable
 }
 
 /** A subscription provider needs its CLI signed in on this machine. */

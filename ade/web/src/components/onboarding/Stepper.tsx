@@ -59,7 +59,7 @@ export function Stepper({
             <span
               aria-hidden
               className={cn(
-                'relative z-10 flex size-6 shrink-0 items-center justify-center rounded-full border text-[11px] font-semibold tabular-nums transition-[background-color,border-color,color,box-shadow] duration-200 ease-[var(--motion-ease-standard)]',
+                'relative z-10 flex size-6 shrink-0 items-center justify-center rounded-full border text-[12px] font-semibold tabular-nums transition-[background-color,border-color,color,box-shadow] duration-200 ease-[var(--motion-ease-standard)]',
                 done
                   ? 'border-ink bg-ink text-bg'
                   : isCurrent
@@ -95,7 +95,8 @@ export function Stepper({
                   ? 'mt-0.5 flex gap-px'
                   : cn(
                       'whitespace-nowrap',
-                      isCurrent ? 'flex' : 'hidden @md:flex',
+                      // Only visually hidden: the label names the step's button.
+                      isCurrent ? 'flex' : 'sr-only @md:not-sr-only @md:flex',
                     ),
               )}
             >

@@ -120,41 +120,36 @@ export function ReadyStep({
     <StepLayout
       centered
       footer={
-        <>
-          <span className="hidden font-sans text-xs text-neutral-500 dark:text-neutral-400 @lg:inline">
-            Reopen setup any time from the command palette.
-          </span>
-          {offerTour ? (
-            <span className="ml-auto flex items-center gap-2">
-              <Button
-                variant="ghost"
-                onClick={() => onStart()}
-                disabled={preparing}
-              >
-                Skip the tour
-              </Button>
-              <Button onClick={onStartTour} disabled={preparing}>
-                {preparing ? (
-                  <LoaderCircle
-                    className="animate-spin motion-reduce:animate-none"
-                    aria-hidden
-                  />
-                ) : null}
-                {preparing
-                  ? 'Preparing the tour…'
-                  : tour.kind === 'failed'
-                    ? 'Try again'
-                    : 'Start the tour'}
-                {preparing ? null : <ArrowRight aria-hidden />}
-              </Button>
-            </span>
-          ) : (
-            <Button className="ml-auto" onClick={() => onStart()}>
-              Start building
-              <ArrowRight aria-hidden />
+        offerTour ? (
+          <span className="ml-auto flex items-center gap-2">
+            <Button
+              variant="ghost"
+              onClick={() => onStart()}
+              disabled={preparing}
+            >
+              Skip the tour
             </Button>
-          )}
-        </>
+            <Button onClick={onStartTour} disabled={preparing}>
+              {preparing ? (
+                <LoaderCircle
+                  className="animate-spin motion-reduce:animate-none"
+                  aria-hidden
+                />
+              ) : null}
+              {preparing
+                ? 'Preparing the tour…'
+                : tour.kind === 'failed'
+                  ? 'Try again'
+                  : 'Start the tour'}
+              {preparing ? null : <ArrowRight aria-hidden />}
+            </Button>
+          </span>
+        ) : (
+          <Button className="ml-auto" onClick={() => onStart()}>
+            Start building
+            <ArrowRight aria-hidden />
+          </Button>
+        )
       }
     >
       <div className="flex flex-col items-center gap-3 text-center">
@@ -262,7 +257,7 @@ export function ReadyStep({
                       </span>
                       <span id={described} className="flex flex-col gap-1.5">
                         {prompt.description ? (
-                          <span className="text-pretty pl-6 font-sans text-xs leading-4 text-neutral-600 dark:text-neutral-400">
+                          <span className="text-pretty pl-6 font-sans text-[13px] leading-5 text-neutral-600 dark:text-neutral-400">
                             {prompt.description}
                           </span>
                         ) : null}
