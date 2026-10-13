@@ -1,4 +1,5 @@
 // @vitest-environment jsdom
+import type * as React from 'react'
 import { act } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
@@ -116,31 +117,62 @@ describe('EngineLog as Continue starts installing', () => {
     container.querySelector('[aria-label="Engine log"]')?.closest('[inert]') ===
     null
 
-  it('opens the log and brings it into view once the run has a step', () => {
+  /** The step body the log sits in, which scrolls; the page never does. */
+  let scroller: HTMLDivElement
+  let scrollTo: ReturnType<typeof vi.fn>
+  const inStep = (node: React.ReactNode) => (
+    <div
+      ref={(el) => {
+        if (!el) return
+        scroller = el
+        el.scrollTo = scrollTo as unknown as typeof el.scrollTo
+      }}
+      style={{ overflowY: 'auto' }}
+    >
+      {node}
+    </div>
+  )
+  beforeEach(() => {
+    scrollTo = vi.fn()
+  })
+
+  it('opens the log, then scrolls the step to it once the run has a step', () => {
     const plan = [
       { kind: 'wait-models', providerId: 'openai', title: 'OpenAI' } as const,
     ]
     act(() =>
-      root.render(<EngineLog plan={plan} entries={[]} running={false} />),
+      root.render(
+        inStep(<EngineLog plan={plan} entries={[]} running={false} />),
+      ),
     )
     expect(logOpen()).toBe(false)
-    expect(scrollIntoView).not.toHaveBeenCalled()
 
     // Running before its first entry lands: nothing to show yet.
-    act(() => root.render(<EngineLog plan={plan} entries={[]} running />))
-    expect(scrollIntoView).not.toHaveBeenCalled()
+    act(() =>
+      root.render(inStep(<EngineLog plan={plan} entries={[]} running />)),
+    )
+    act(() => vi.advanceTimersByTime(500))
+    expect(scrollTo).not.toHaveBeenCalled()
 
     act(() =>
-      root.render(<EngineLog plan={plan} entries={[entry(0)]} running />),
+      root.render(
+        inStep(<EngineLog plan={plan} entries={[entry(0)]} running />),
+      ),
     )
     expect(logOpen()).toBe(true)
-    const [options] = scrollIntoView.mock.calls[0] ?? []
-    expect(options).toMatchObject({ block: 'start' })
+    // It waits for the log to finish opening, then scrolls the step body.
+    expect(scrollTo).not.toHaveBeenCalled()
+    act(() => vi.advanceTimersByTime(200))
+    expect(scrollTo).toHaveBeenCalledTimes(1)
+    expect(scroller).toBeDefined()
   })
 
   it('reveals once per run, so folding it again sticks', () => {
-    act(() => root.render(<EngineLog plan={[]} entries={[entry(0)]} running />))
-    const first = scrollIntoView.mock.calls.length
+    act(() =>
+      root.render(inStep(<EngineLog plan={[]} entries={[entry(0)]} running />)),
+    )
+    act(() => vi.advanceTimersByTime(200))
+    expect(scrollTo).toHaveBeenCalledTimes(1)
     // The person folds it; the run carries on with a second step.
     act(() => {
       const toggle = [...container.querySelectorAll('button')].find((button) =>
@@ -151,18 +183,21 @@ describe('EngineLog as Continue starts installing', () => {
     expect(logOpen()).toBe(false)
     act(() =>
       root.render(
-        <EngineLog
-          plan={[]}
-          entries={[
-            { ...entry(0), status: 'done' },
-            { ...entry(0), id: 2 },
-          ]}
-          running
-        />,
+        inStep(
+          <EngineLog
+            plan={[]}
+            entries={[
+              { ...entry(0), status: 'done' },
+              { ...entry(0), id: 2 },
+            ]}
+            running
+          />,
+        ),
       ),
     )
+    act(() => vi.advanceTimersByTime(500))
     expect(logOpen()).toBe(false)
-    expect(scrollIntoView.mock.calls.length).toBe(first)
+    expect(scrollTo).toHaveBeenCalledTimes(1)
   })
 })
 

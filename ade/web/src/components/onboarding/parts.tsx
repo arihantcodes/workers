@@ -69,7 +69,7 @@ export function StepHeader({
   return (
     <header className="flex flex-col gap-1">
       <div className="flex min-h-8 items-center justify-between gap-3">
-        <h2 className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-balance font-sans text-base font-semibold leading-6 tracking-[-0.01em] text-ink">
+        <h2 className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-balance font-sans text-xl font-semibold leading-6 tracking-[-0.01em] text-ink">
           {eyebrow ? <span className="sr-only">{eyebrow}. </span> : null}
           {title}
           {tag ? <StatusChip tone="neutral">{tag}</StatusChip> : null}
@@ -100,7 +100,7 @@ export function Section({
   return (
     <section className="flex flex-col gap-2" aria-label={title}>
       <div className="flex min-h-5 flex-wrap items-baseline justify-between gap-x-3 gap-y-0.5">
-        <h3 className="flex min-w-0 flex-wrap items-baseline gap-x-1.5 font-sans text-[23px] font-medium leading-5 text-ink">
+        <h3 className="flex min-w-0 flex-wrap items-baseline gap-x-1.5 font-sans text-lg font-medium leading-7 text-ink">
           <span className="shrink-0">{title}</span>
           {hint ? (
             <span className="truncate text-xs font-normal text-neutral-500 dark:text-neutral-400">
@@ -268,6 +268,7 @@ export function EngineLog({
   // who folds it again keeps it folded.
   const section = useRef<HTMLDivElement>(null)
   const revealed = useRef(false)
+  const revealTimer = useRef<number | undefined>(undefined)
   useEffect(() => {
     if (!running) {
       revealed.current = false
@@ -277,11 +278,16 @@ export function EngineLog({
     if (revealed.current || !section.current || entries.length === 0) return
     revealed.current = true
     setOpen(true)
-    section.current.scrollIntoView({
-      block: 'start',
-      behavior: reduceMotion ? 'instant' : 'smooth',
-    })
+    // Scroll once the log has opened, so what it shows is in view too. Kept
+    // in a ref: the next entry re-runs this effect and must not cancel it.
+    revealTimer.current = window.setTimeout(
+      () => {
+        if (section.current) revealInScroller(section.current, !reduceMotion)
+      },
+      reduceMotion ? 0 : DISCLOSURE_MS,
+    )
   }, [running, entries.length, reduceMotion])
+  useEffect(() => () => window.clearTimeout(revealTimer.current), [])
   // Keep the line that is moving in view while the log is open.
   useEffect(() => {
     if (!moving || !open) return
@@ -457,6 +463,34 @@ export function useNow(active: boolean): number {
     return () => window.clearInterval(timer)
   }, [active])
   return now
+}
+
+/** How long `Disclosure` takes to open (its grid-track transition). */
+const DISCLOSURE_MS = 200
+
+/**
+ * Scroll `element` into view inside its nearest scrolling ancestor only (the
+ * step body), never the page: all of it when it fits, else its top.
+ */
+export function revealInScroller(element: HTMLElement, smooth: boolean) {
+  let scroller = element.parentElement
+  while (
+    scroller &&
+    !/(auto|scroll)/.test(getComputedStyle(scroller).overflowY)
+  ) {
+    scroller = scroller.parentElement
+  }
+  if (!scroller) return
+  const view = scroller.getBoundingClientRect()
+  const box = element.getBoundingClientRect()
+  const margin = 16
+  const toTop = scroller.scrollTop + box.top - view.top - margin
+  const toBottom = scroller.scrollTop + box.bottom - view.bottom + margin
+  const top = Math.max(
+    0,
+    Math.min(toTop, Math.max(scroller.scrollTop, toBottom)),
+  )
+  scroller.scrollTo({ top, behavior: smooth ? 'smooth' : 'instant' })
 }
 
 /** What the live region says about the latest step: one line, no timer. */
