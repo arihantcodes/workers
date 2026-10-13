@@ -287,6 +287,9 @@ async fn ensure_configuration(iii: &IIIClient, payload: serde_json::Value) -> Re
     .await
 }
 
+// The shared module also carries `get_value_with`, which this worker does
+// not call (the ide worker does).
+#[allow(dead_code)]
 #[path = "../../crates/config-client/src/initialization.rs"]
 mod initialization;
 
