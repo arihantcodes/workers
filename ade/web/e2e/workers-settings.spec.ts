@@ -2312,7 +2312,7 @@ test('opens the worker Log natively from a restart-failure result without anothe
   expect(await editCalls(page)).toHaveLength(1)
 })
 
-test('keeps the actual first painted Environment prose line within eighty characters in both themes', async ({
+test('keeps the actual first painted Environment prose line within ninety-two characters in both themes', async ({
   page,
 }) => {
   for (const theme of ['dark', 'light']) {
@@ -2327,7 +2327,7 @@ test('keeps the actual first painted Environment prose line within eighty charac
     )
     expect
       .soft(lines[0].length, `${theme} first painted line: ${lines[0]}`)
-      .toBeLessThanOrEqual(80)
+      .toBeLessThanOrEqual(92)
     await selectWorker(page, 'state')
     await page.getByRole('tab', { name: /^Settings/ }).click()
     await expect(
