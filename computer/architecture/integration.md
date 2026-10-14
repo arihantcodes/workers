@@ -9,13 +9,14 @@ returned; `sessions::list` and `displays` are the two that do not.
 
 | Function | In | Out |
 |---|---|---|
-| `computer::sessions::start` | `image?`, `endpoint?`, `os?`, `monitor?` | `session_id`, `endpoint`, `os`, `screen` |
-| `computer::sessions::list` | — | `sessions[]` with endpoint, os, screen, timestamps, screencast state |
+| `computer::sessions::start` | `image?`, `endpoint?`, `os?`, `monitor?` | `session_id`, `endpoint`, `os`, `screen`, `semantic` |
+| `computer::sessions::list` | — | `sessions[]` with endpoint, os, screen, timestamps, screencast state, `semantic` |
 | `computer::sessions::stop` | `session_id` | `ok`, `was_running` (idempotent) |
 | `computer::displays` | — | local `displays[]`; empty off a desktop host |
 | `computer::screenshot` | `session_id` | image + text content blocks, `details.width/height/mime` |
-| `computer::observe` | `session_id`, `include_a11y?` | screenshot plus the accessibility tree where the guest has one |
-| `computer::act` | `session_id`, `action`, coordinates / `text` / `keys` | `ok`, `detail` |
+| `computer::observe` | `session_id`, `include_image?` (true), `include_a11y?` (false), `app_pid?`/`app_name?`/`root_ref?`, `max_nodes?` (≤256), `max_depth?` (≤12) | image (optional) + text content; with `include_a11y`, the tree as `[ref=…]` lines |
+| `computer::find` | `session_id`, `selector`, `app_pid?`/`app_name?`/`root_ref?`, `max_nodes?`, `max_depth?`, `timeout_ms?` (≤30000) | `tree`, `matches`, `truncated`, `waited_ms` |
+| `computer::act` | `session_id`, `action`, coordinates / `text` / `keys`, or `ref` | `ok`, `detail` |
 
 `act` actions: `click` (`left_click`), `right_click`, `double_click`, `move`,
 `drag` (`to_x`/`to_y`), `scroll` (`scroll_x`/`scroll_y`), `type` (`text`),
@@ -25,6 +26,30 @@ returned; `sessions::list` and `displays` are the two that do not.
 contract: screenshot, read a position off the image, act on it. After anything
 that changes the screen, screenshot again before acting — a stale coordinate is
 a click somewhere else.
+
+**By ref** (native macOS/Windows sessions): `invoke`, `set_value` (`text`),
+`toggle`, `select`, on a ref from `observe` (with `include_a11y`) or `find`.
+Refusals come back as errors with a stable code — `invalid_input`,
+`invalid_selector`, `stale_ref`, `not_supported`, `busy`,
+`permission_denied`, `unsupported_session`, `backend_error` — none of which
+had any effect; `effect_unknown` means the action may or may not have
+happened. With `include_image=true`, `observe` still returns the image when the
+tree cannot be read right now (`unsupported_session`, `permission_denied`,
+`backend_error`, `busy`), with an appended `a11y tree unavailable: <code>: …`
+line; a wrong request (`invalid_input`, `stale_ref`) is an error either way,
+except that an empty foreground (no `app_*`/`root_ref` and no app in front)
+also degrades to that line.
+Every tree starts with the untrusted-content marker and an
+`app "<name>" pid <n>` line. `find` with `timeout_ms` also waits for an
+`app_name` that is not running yet, or for any app to reach the foreground.
+All native sessions share one desktop: a coordinate or keyboard action on any
+of them kills the refs of all of them. On Windows
+`invoke` falls through Invoke → Toggle → Select → ExpandCollapse.
+`sessions::start` and `sessions::list` report `semantic: { supported,
+reason? }` per session. Remote and sandbox sessions no longer return a tree:
+`observe` with `include_a11y` appends
+`a11y tree unavailable: unsupported_session` (or fails with that code when
+`include_image` is false).
 
 `computer::screencast::start` / `stop` and `computer::frame` are console
 plumbing (flagged internal, denied in `iii-permissions.yaml`). Agents use

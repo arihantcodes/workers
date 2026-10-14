@@ -15,7 +15,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::{Arc, LazyLock, Mutex as StdMutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use iii_sdk::protocol::TriggerRequest;
@@ -73,6 +73,39 @@ fn native_driver(
     )
 }
 
+/// The accessibility layer for a native session on this OS, counting
+/// invalidations on the shared native desktop.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn native_semantic(invalidations: Arc<AtomicU64>) -> Option<crate::semantic::SemanticSession> {
+    Some(crate::semantic::SemanticSession::on_desktop(
+        crate::semantic::platform::factory(),
+        invalidations,
+    ))
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn native_semantic(_: Arc<AtomicU64>) -> Option<crate::semantic::SemanticSession> {
+    None
+}
+
+/// Every native session drives the same mouse, keyboard and windows, so all
+/// of them share one act lock and one ref-invalidation counter: input on any
+/// of them kills refs on all of them and never interleaves with another's
+/// action. A remote or sandboxed desktop gets its own lock and no
+/// accessibility layer.
+fn desktop_for(endpoint: &str) -> (Arc<Mutex<()>>, Option<crate::semantic::SemanticSession>) {
+    static NATIVE_ACT_LOCK: LazyLock<Arc<Mutex<()>>> = LazyLock::new(Default::default);
+    static NATIVE_INVALIDATIONS: LazyLock<Arc<AtomicU64>> = LazyLock::new(Default::default);
+    if endpoint == "native" {
+        (
+            NATIVE_ACT_LOCK.clone(),
+            native_semantic(NATIVE_INVALIDATIONS.clone()),
+        )
+    } else {
+        (Arc::new(Mutex::new(())), None)
+    }
+}
+
 /// The newest screencast frame, handed to `computer::frame` without a capture
 /// round-trip.
 #[derive(Clone)]
@@ -116,11 +149,17 @@ pub struct Session {
     screencast_task: Mutex<Option<JoinHandle<()>>>,
     config: SharedConfig,
     frames: Arc<FrameNotifier>,
+    /// Accessibility layer: native macOS/Windows sessions only.
+    pub semantic: Option<crate::semantic::SemanticSession>,
+    /// Serializes coordinate and semantic actions on this desktop (one lock
+    /// for every native session), so a coordinate action can never land
+    /// between a semantic action's checks and its dispatch.
+    pub act_lock: Arc<Mutex<()>>,
 }
 
 impl Session {
     #[allow(clippy::too_many_arguments)]
-    fn new(
+    pub(crate) fn new(
         id: String,
         endpoint: String,
         os: String,
@@ -129,6 +168,8 @@ impl Session {
         driver: Arc<dyn Driver>,
         config: SharedConfig,
         frames: Arc<FrameNotifier>,
+        act_lock: Arc<Mutex<()>>,
+        semantic: Option<crate::semantic::SemanticSession>,
     ) -> Arc<Self> {
         Arc::new(Self {
             id,
@@ -145,6 +186,8 @@ impl Session {
             screencast_task: Mutex::new(None),
             config,
             frames,
+            semantic,
+            act_lock,
         })
     }
 
@@ -293,6 +336,9 @@ impl Session {
     /// Tear down: stop the screencast pump (clearing the stored frame), then
     /// close the driver. Idempotent.
     async fn shutdown(&self) {
+        if let Some(semantic) = &self.semantic {
+            semantic.close();
+        }
         self.stop_screencast().await;
         if let Err(e) = self.driver.close().await {
             tracing::warn!(session = %self.id, error = %e, "driver close failed");
@@ -422,6 +468,7 @@ impl Sessions {
 
         let seq = self.counter.fetch_add(1, Ordering::Relaxed) + 1;
         let id = format!("c{seq}");
+        let (act_lock, semantic) = desktop_for(&endpoint_used);
         let session = Session::new(
             id.clone(),
             endpoint_used,
@@ -431,6 +478,8 @@ impl Sessions {
             driver,
             self.config.clone(),
             self.frames.clone(),
+            act_lock,
+            semantic,
         );
         // The slot this session claimed becomes the map entry; releasing the
         // guard after the insert keeps the two counts from ever both missing it.
@@ -604,6 +653,7 @@ impl Sessions {
             (Arc::new(client), label)
         };
         let screen = driver.screen_size().await?;
+        let (act_lock, semantic) = desktop_for(&endpoint_used);
         Ok(Session::new(
             rec.session_id.clone(),
             endpoint_used,
@@ -613,6 +663,8 @@ impl Sessions {
             driver,
             self.config.clone(),
             self.frames.clone(),
+            act_lock,
+            semantic,
         ))
     }
 
@@ -700,68 +752,12 @@ async fn side_write(iii: &IIIClient, function_id: &str, payload: Value) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::driver::Shot;
     use crate::frames::{FrameSink, FrameTarget};
     use crate::functions::frame::read_latest;
+    use crate::test_support::FakeDesktop;
     use async_trait::async_trait;
     use iii_sdk::trigger::TriggerConfig;
     use std::sync::Weak;
-
-    /// A desktop whose every screenshot is a distinct ~64 KB JPEG-looking
-    /// buffer; `fail` makes captures error (a broken driver).
-    struct FakeDesktop {
-        shots: AtomicU64,
-        fail: AtomicBool,
-    }
-
-    #[async_trait]
-    impl Driver for FakeDesktop {
-        async fn screen_size(&self) -> Result<Screen, String> {
-            Ok(Screen {
-                width: 1280,
-                height: 800,
-            })
-        }
-        async fn screenshot(&self) -> Result<Shot, String> {
-            if self.fail.load(Ordering::SeqCst) {
-                return Err("display went away".to_string());
-            }
-            let n = self.shots.fetch_add(1, Ordering::SeqCst);
-            let mut bytes = vec![0xFF, 0xD8, 0xFF, 0xE0];
-            bytes.extend(std::iter::repeat_n((n % 251) as u8, 64 * 1024));
-            Ok(Shot::new(bytes))
-        }
-        async fn left_click(&self, _: i64, _: i64) -> Result<(), String> {
-            Ok(())
-        }
-        async fn right_click(&self, _: i64, _: i64) -> Result<(), String> {
-            Ok(())
-        }
-        async fn double_click(&self, _: i64, _: i64) -> Result<(), String> {
-            Ok(())
-        }
-        async fn move_cursor(&self, _: i64, _: i64) -> Result<(), String> {
-            Ok(())
-        }
-        async fn scroll(&self, _: i64, _: i64, _: i64, _: i64) -> Result<(), String> {
-            Ok(())
-        }
-        async fn drag(&self, _: (i64, i64), _: (i64, i64), _: &str) -> Result<(), String> {
-            Ok(())
-        }
-        async fn type_text(&self, _: &str) -> Result<(), String> {
-            Ok(())
-        }
-        async fn keypress(&self, _: &[String]) -> Result<(), String> {
-            Ok(())
-        }
-        async fn accessibility_tree(&self) -> Result<Value, String> {
-            Ok(Value::Null)
-        }
-        async fn close(&self) -> Result<(), String> {
-            Ok(())
-        }
-    }
 
     /// Records every notification it receives, per target function.
     #[derive(Default)]
@@ -791,28 +787,7 @@ mod tests {
     }
 
     fn session(id: &str, notifier: &Arc<FrameNotifier>) -> (Arc<Session>, Arc<FakeDesktop>) {
-        let desktop = Arc::new(FakeDesktop {
-            shots: AtomicU64::new(0),
-            fail: AtomicBool::new(false),
-        });
-        let cfg = crate::config::WorkerConfig {
-            screencast_fps: 200, // 5 ms frames keep the test fast
-            ..Default::default()
-        };
-        let s = Session::new(
-            id.to_string(),
-            "fake".to_string(),
-            "linux".to_string(),
-            Screen {
-                width: 1280,
-                height: 800,
-            },
-            now_ms(),
-            desktop.clone(),
-            cfg.into_shared(),
-            notifier.clone(),
-        );
-        (s, desktop)
+        crate::test_support::session_on(notifier, id, None)
     }
 
     fn bind(notifier: &FrameNotifier, id: &str, session_id: &str) {
@@ -996,5 +971,65 @@ mod tests {
         s.stop_screencast().await;
         tokio::time::sleep(Duration::from_millis(20)).await;
         assert!(viewers.for_fn("viewer::v").is_empty());
+    }
+
+    #[tokio::test]
+    async fn shutdown_closes_the_semantic_layer() {
+        use crate::semantic::{fake::FakeTree, Code, Query, Scope, SemanticSession};
+        let tree = Arc::new(FakeTree::new("App", 1));
+        let notifier = FrameNotifier::new(Arc::new(Viewers::default()));
+        let (s, _) = crate::test_support::session_on(
+            &notifier,
+            "c9",
+            Some(SemanticSession::new(tree.factory())),
+        );
+        let q = Query {
+            scope: Scope::default(),
+            selector: None,
+            max_nodes: 256,
+            max_depth: 6,
+        };
+        s.semantic
+            .as_ref()
+            .unwrap()
+            .snapshot(q.clone(), true)
+            .await
+            .unwrap();
+        s.shutdown().await;
+        let err = s
+            .semantic
+            .as_ref()
+            .unwrap()
+            .snapshot(q, true)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, Code::UnsupportedSession);
+    }
+
+    #[test]
+    fn native_sessions_share_a_desktop_and_others_do_not() {
+        let (a, _) = desktop_for("native");
+        let (b, _) = desktop_for("native");
+        let (c, semantic) = desktop_for("ws://10.0.0.5:8765");
+        assert!(Arc::ptr_eq(&a, &b));
+        assert!(!Arc::ptr_eq(&a, &c));
+        assert!(semantic.is_none());
+    }
+
+    #[tokio::test]
+    async fn stopping_a_session_never_waits_for_the_shared_desktop() {
+        use crate::semantic::{fake::FakeTree, SemanticSession};
+        let lock = Arc::new(Mutex::new(()));
+        let tree = Arc::new(FakeTree::new("App", 1));
+        let (s1, _) = crate::test_support::session_sharing("c1", lock.clone(), None);
+        let (s2, _) = crate::test_support::session_sharing(
+            "c2",
+            lock.clone(),
+            Some(SemanticSession::new(tree.factory())),
+        );
+        let _held = s1.act_lock.lock().await;
+        tokio::time::timeout(Duration::from_secs(1), s2.shutdown())
+            .await
+            .expect("shutdown waited for the shared act lock");
     }
 }
