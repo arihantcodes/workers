@@ -86,15 +86,36 @@ fn cosine(a: &[f32], b: &[f32]) -> f32 {
     dot / (na * nb)
 }
 
-/// Query tokens, with first-person pronouns expanded to the `user` entity
-/// handle so identity questions reach memories phrased about the user.
+/// English function words dropped from QUERIES before lexical scoring (the
+/// index keeps every token), as Hindsight's lexical arm gets from Postgres's
+/// `english` tsvector. Without it a natural-language question matches every
+/// memory through "the/do/my", and that BM25 noise outscores a paraphrase's
+/// semantic match. "us" is kept (US), as Snowball's English list does.
+#[rustfmt::skip]
+const STOPWORDS: &[&str] = &[
+    "a", "about", "again", "all", "also", "am", "an", "and", "any", "are", "as", "at", "be",
+    "been", "being", "but", "by", "can", "could", "d", "did", "do", "does", "doing", "for",
+    "from", "had", "has", "have", "having", "he", "her", "here", "hers", "him", "his", "how",
+    "i", "if", "in", "into", "is", "it", "its", "just", "ll", "m", "me", "mine", "more", "most",
+    "my", "myself", "no", "not", "now", "of", "off", "on", "only", "or", "other", "our", "out",
+    "over", "own", "re", "s", "same", "she", "should", "so", "some", "still", "such", "t",
+    "than", "that", "the", "their", "them", "then", "there", "these", "they", "this", "those",
+    "to", "too", "under", "up", "ve", "very", "was", "we", "were", "what", "when", "where",
+    "which", "who", "whom", "whose", "why", "will", "with", "would", "you", "your", "yours",
+];
+
+/// Query tokens without stopwords (all kept when nothing else is left), with
+/// first-person pronouns expanded to the `user` entity handle so identity
+/// questions reach memories phrased about the user.
 fn query_tokens(query: &str) -> Vec<String> {
     let mut tokens = crate::index::tokenize(query);
-    if tokens
+    let first_person = tokens
         .iter()
-        .any(|t| matches!(t.as_str(), "i" | "me" | "my" | "mine" | "myself"))
-        && !tokens.iter().any(|t| t == "user")
-    {
+        .any(|t| matches!(t.as_str(), "i" | "me" | "my" | "mine" | "myself"));
+    if tokens.iter().any(|t| !STOPWORDS.contains(&t.as_str())) {
+        tokens.retain(|t| !STOPWORDS.contains(&t.as_str()));
+    }
+    if first_person && !tokens.iter().any(|t| t == "user") {
         tokens.push("user".to_string());
     }
     tokens
@@ -735,6 +756,21 @@ mod tests {
             revision: 0,
             stated_at: None,
         }
+    }
+
+    #[test]
+    fn query_tokens_drop_stopwords_but_never_empty_the_query() {
+        assert_eq!(
+            query_tokens("what is my dog's name"),
+            ["dog", "name", "user"]
+        );
+        assert_eq!(query_tokens("which OS do I use"), ["os", "use", "user"]);
+        assert_eq!(
+            query_tokens("does the user live in the US"),
+            ["user", "live", "us"]
+        );
+        // An all-stopword query keeps its tokens rather than matching nothing.
+        assert_eq!(query_tokens("what is it"), ["what", "is", "it"]);
     }
 
     #[tokio::test]
