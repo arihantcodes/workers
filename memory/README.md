@@ -40,6 +40,7 @@ All fields hot-reload through the `configuration` worker and are editable in the
 - **Tags.** Topical labels WITHIN a bank ("iii", "billing") for filtering — organization, not ranking. Set them on save/update, extraction suggests them automatically, and `memory::list`/`memory::recall` take a `tag` filter.
 - **One LLM call per turn, zero at query time.** Extraction runs in the background after a turn completes (ADD-only, content-fingerprinted so redelivery reinforces instead of duplicating). Recall is BM25 + entity match + corroboration + recency, plus a semantic signal when `router::embed` is available: sub-millisecond at this scale.
 - **Rules learn from corrections.** Extraction classifies standing instructions (style directives, workflow corrections) separately from memories and appends them to the bank's auto-managed `learned` rule — correcting the agent in chat reaches every later turn (new sessions in the system prompt, running ones as an appended rules update). Hand-authored rules are never touched; dedup by content fingerprint; `rule_learning_enabled` turns it off.
+- **Time-aware.** Extraction reads each message with its own date and writes dated events ("tomorrow", "next Friday") as absolute dates; every injected memory carries its last-updated date, and the block names the day it was recalled.
 - **Honest health.** `memory::doctor` runs a real save→recall→trash roundtrip and reports sibling reachability. `memory::recall` names the retrieval mode it ran. Degradation is explicit, never silent.
 
 ## How it hooks into the harness
@@ -93,6 +94,16 @@ process current directory for the same relative default.
     memories.jsonl     # append-only memory log (full records, last-wins by id)
     vectors.jsonl      # derived embedding sidecar (rebuildable)
   .trash/              # trashed banks, timestamped
+```
+
+## Recall quality eval
+
+`tests/recall_quality.rs` scores the production `Bank::recall` over a synthetic golden bank (`tests/recall_quality/golden.json`: one persona, 72 memories, 62 English/Portuguese queries across lexical, paraphrase, identity, temporal-update, dated-event and durable-old categories). It runs in `lexical` mode and in `hybrid` mode with cached `text-embedding-3-small` vectors. It reports hit@1/3, MRR@10, nDCG@10 and recall@10 per category and language, and counts **traps**: a superseded memory outranking the current one. The committed snapshot `tests/golden/recall_quality.json` makes it a PR gate. The metric conventions follow Hindsight's retrieval eval.
+
+```bash
+cargo test --test recall_quality -- --nocapture                # report
+UPDATE_GOLDENS=1 cargo test --test recall_quality              # re-baseline after an intended change
+III_NAMESPACE=<ns> cargo test --test recall_quality -- --ignored embed_golden_set   # re-embed after editing golden.json
 ```
 
 ## Permissions
