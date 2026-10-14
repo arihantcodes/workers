@@ -1,4 +1,7 @@
 [workspace]
+# Vendored crates build and test on their own (own Cargo.lock), outside this
+# workspace's fmt and clippy; CI runs their tests separately.
+exclude = ["vendor/xa11y-linux"]
 
 [package]
 name = "computer"
@@ -35,10 +38,9 @@ base64 = "0.22"
 # the platform backends below are the only crates that touch OS APIs.
 xa11y-core = "=0.15.2"
 
-# Native host backend (screen capture + input injection). Only meaningful on a
-# desktop OS, and these pull system libraries (dbus/xcb/xdo) that headless Linux
-# servers and CI do not have, so they are gated to macOS/Windows. Other targets
-# build with the computer-server backend only.
+# Native host backend on macOS/Windows (screen capture + input injection).
+# These pull system libraries on Linux (libxdo, libxkbcommon, pipewire, xcb),
+# so Linux has its own driver below.
 [target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
 enigo = "0.3"
 xcap = "0.9"
@@ -52,6 +54,21 @@ xa11y-macos = "=0.15.2"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 xa11y-windows = "=0.15.2"
+
+# Native host on Linux: our own X11 driver (src/driver/native/x11.rs) over
+# pure-Rust x11rb — GetImage capture, RandR monitors, XTest input — so every
+# Linux release triple (gnu and musl) still builds with no system C library.
+[target.'cfg(target_os = "linux")'.dependencies]
+x11rb = { version = "0.14", default-features = false, features = ["xtest", "randr"] }
+xkeysym = "0.2"
+image = { version = "0.25", default-features = false, features = ["jpeg"] }
+# AT-SPI semantic backend: xa11y-linux 0.15.2 vendored with our patches and
+# without its Wayland/uinput/portal code (vendor/xa11y-linux/PATCHES.md).
+xa11y-linux = { path = "vendor/xa11y-linux" }
+# Read-only AT-SPI bus probe (org.a11y.Bus GetAddress, org.a11y.Status
+# IsEnabled); same version and features as the vendored crate, so no new
+# crate enters the graph.
+zbus = { version = "5", default-features = false, features = ["async-io", "blocking-api"] }
 
 [dev-dependencies]
 serde_json = "1"

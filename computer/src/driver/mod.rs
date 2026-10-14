@@ -1,19 +1,23 @@
 //! The environment driver: one desktop the worker drives. The [`Driver`]
-//! trait keeps [`crate::session::Session`] driver-agnostic; three
+//! trait keeps [`crate::session::Session`] driver-agnostic; four
 //! implementations slot in behind it:
 //!
 //! - [`RemoteClient`] speaks the guest-executor wire (`{command, params}`
 //!   over a WebSocket) to a remote or sandboxed desktop.
 //! - [`NativeHost`] drives the local machine this worker runs on (macOS /
-//!   Windows), capturing and injecting input directly.
+//!   Windows / Linux X11), capturing and injecting input directly.
 //! - [`IiiSandboxHost`] boots a desktop inside an iii-sandbox microVM and
 //!   drives it through iii primitives (`sandbox::exec` / `sandbox::fs`), with
 //!   no executor and no socket into the guest.
+//! - [`SemanticOnly`] is a native session whose desktop gives this worker no
+//!   screen or input (a Wayland compositor): every coordinate call is refused
+//!   with the reason, and only the accessibility layer works.
 
-#[cfg(any(target_os = "macos", target_os = "windows"))]
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
 pub mod native;
 pub mod remote;
 pub mod sandbox;
+pub mod semantic_only;
 
 use async_trait::async_trait;
 use base64::engine::general_purpose::STANDARD;
@@ -21,10 +25,11 @@ use base64::Engine;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-#[cfg(any(target_os = "macos", target_os = "windows"))]
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
 pub use native::NativeHost;
 pub use remote::RemoteClient;
 pub use sandbox::IiiSandboxHost;
+pub use semantic_only::SemanticOnly;
 
 /// Desktop pixel dimensions. Coordinates handed to pointer actions are in this
 /// space: integer pixels, top-left origin, 1:1 with the screenshot.
@@ -42,9 +47,9 @@ pub struct DisplayInfo {
     pub name: String,
     pub primary: bool,
     pub builtin: bool,
-    /// Logical width in points.
+    /// Width: points on macOS, pixels on Windows and Linux.
     pub width: u32,
-    /// Logical height in points.
+    /// Height, in the same unit.
     pub height: u32,
 }
 
@@ -108,6 +113,12 @@ pub trait Driver: Send + Sync {
     /// Close the underlying connection. Idempotent: closing an
     /// already-closed driver succeeds.
     async fn close(&self) -> Result<(), String>;
+
+    /// Why this session takes no coordinates (no screenshots, pointer or
+    /// keyboard), or `None` when it does. Only [`SemanticOnly`] says why.
+    fn coordinates(&self) -> Option<&str> {
+        None
+    }
 }
 
 #[cfg(test)]

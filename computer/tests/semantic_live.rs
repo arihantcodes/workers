@@ -9,9 +9,10 @@
 //!
 //! macOS needs Accessibility and Screen Recording for the terminal running
 //! it; Windows needs an interactive desktop (hosted windows-latest has one).
+//! Linux runs it through tests/run-linux-live.sh (private Xvfb + D-Bus + AT-SPI).
 //! `COMPUTER_A11Y_FIXTURE_LOG_DIR` picks where the fixture logs go (default:
 //! the temp dir); CI uploads them when the job fails.
-#![cfg(any(target_os = "macos", target_os = "windows"))]
+#![cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
 
 use std::path::PathBuf;
 use std::process::{Child, Command};
@@ -22,6 +23,7 @@ use computer::driver::{DisplayInfo, Driver, NativeHost};
 use computer::semantic::{parse_selector, platform, Code, Query, Scope, SemanticSession, Verb};
 
 const SECRET: &str = "s3cr3t-fixture";
+const SECRET_B: &str = "campo-b-s3cr3t";
 
 struct Fixture {
     child: Child,
@@ -390,6 +392,8 @@ async fn the_password_value_never_leaves() {
     let tree = s.snapshot(query(f.pid(), None), true).await.unwrap();
     assert!(tree.text.contains("Senha"), "{}", tree.text);
     assert!(!tree.text.contains(SECRET));
+    // Positive control: the field is there, so 0 below means the value hid it.
+    assert_eq!(find(&s, f.pid(), "[name='Senha']").await.matches, 1);
     assert_eq!(
         find(&s, f.pid(), "[name='Senha'][value^='s']")
             .await
@@ -404,6 +408,23 @@ async fn the_password_value_never_leaves() {
         parse_selector("[AXValue^='s']").unwrap_err().code,
         Code::InvalidSelector
     );
+    // A neutral name: only the password role can hide it (AT-SPI, AX). UIA
+    // redacts by name only, so Windows shows it (a documented limit).
+    if cfg!(not(target_os = "windows")) {
+        assert!(tree.text.contains("Campo B"), "{}", tree.text);
+        assert!(!tree.text.contains(SECRET_B), "{}", tree.text);
+        assert_eq!(find(&s, f.pid(), "[name='Campo B']").await.matches, 1);
+        assert_eq!(
+            find(&s, f.pid(), "[name='Campo B'][value^='c']")
+                .await
+                .matches,
+            0
+        );
+    }
+    assert_eq!(
+        parse_selector("[atspi_value^='s']").unwrap_err().code,
+        Code::InvalidSelector
+    );
     settle();
     assert!(f.requests().is_empty(), "{:?}", f.requests());
 }
@@ -411,7 +432,8 @@ async fn the_password_value_never_leaves() {
 /// Click the centre of the fixture window through the coordinate driver,
 /// mapping screen coordinates into the session's (downscaled) image space.
 /// The fixture logs physical pixels; `list_displays` sizes are what `xcap`
-/// reports — physical on Windows (per-monitor-v2), logical points on macOS.
+/// reports — physical on Windows (per-monitor-v2) and Linux, logical points
+/// on macOS.
 async fn click_center(host: &NativeHost, display: &DisplayInfo, win: Win) {
     host.screenshot().await.unwrap();
     let image = host.screen_size().await.unwrap();
@@ -438,6 +460,16 @@ fn mouse_clicks(f: &Fixture) -> Vec<(i64, i64)> {
         .collect()
 }
 
+/// The primary display, or the first when none is primary (Xvfb marks none).
+fn main_display() -> DisplayInfo {
+    let all = computer::driver::native::list_displays().unwrap();
+    all.iter()
+        .find(|d| d.primary)
+        .or(all.first())
+        .cloned()
+        .expect("a display")
+}
+
 /// Smoke test: a coordinate click on the fixture lands, and still lands after
 /// a semantic call in the same process.
 #[tokio::test]
@@ -450,11 +482,7 @@ async fn a_coordinate_click_lands_before_and_after_semantic_use() {
     let window = f.window().unwrap();
     let (ww, wh) = (window.w, window.h);
     let host = NativeHost::new(4096, 80, None);
-    let display = computer::driver::native::list_displays()
-        .unwrap()
-        .into_iter()
-        .find(|d| d.primary)
-        .expect("a primary display");
+    let display = main_display();
     click_center(&host, &display, window).await;
     wait_for("the first click", || mouse_clicks(&f).len() == 1).await;
     let s = session();
@@ -470,4 +498,75 @@ async fn a_coordinate_click_lands_before_and_after_semantic_use() {
             "click at ({cx}, {cy}) in {ww}x{wh}"
         );
     }
+}
+
+/// The private session of run-linux-live.sh turns accessibility on, so the
+/// probe must say so with no warning.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[ignore]
+async fn the_live_bus_reports_accessibility_on() {
+    assert_eq!(platform::a11y_support().await, (true, None));
+}
+
+/// What the fixture's window received as text, `escape_debug`-ed per key.
+#[cfg(target_os = "linux")]
+fn typed(f: &Fixture) -> String {
+    f.lines()
+        .iter()
+        .filter_map(|l| l.strip_prefix("key "))
+        .collect()
+}
+
+/// X11 typing, including characters missing from Xvfb's US map (bound to a
+/// spare keycode for the call): the fixture's window receives them, and
+/// Return arrives as "\r".
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[ignore]
+async fn type_reaches_the_window_including_unmapped_characters() {
+    let f = Fixture::launch().await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let window = f.window().unwrap();
+    let host = NativeHost::new(4096, 80, None);
+    // The fixture draws no widgets; the click puts the pointer on its window.
+    click_center(&host, &main_display(), window).await;
+    wait_for("the click", || mouse_clicks(&f).len() == 1).await;
+    // With no window manager nothing focuses a clicked window, and winit
+    // drops keys until its window gets FocusIn: do the window manager's part.
+    {
+        use x11rb::connection::Connection;
+        use x11rb::protocol::xproto::{ConnectionExt, InputFocus};
+        let (c, screen) = x11rb::connect(None).unwrap();
+        let root = c.setup().roots[screen].root;
+        let under = c.query_pointer(root).unwrap().reply().unwrap().child;
+        c.set_input_focus(InputFocus::POINTER_ROOT, under, x11rb::CURRENT_TIME)
+            .unwrap();
+        assert_eq!(c.get_input_focus().unwrap().reply().unwrap().focus, under);
+    }
+    // 19 distinct characters missing from the map, more than Xvfb's 15 free
+    // keycodes: the second segment rebinds them, and must arrive as typed.
+    let text = "ação €ł日本語中文한국어ñöüßøåæ";
+    host.type_text(&format!("{text}\n")).await.unwrap();
+    let want = format!("{text}\\r");
+    wait_for("the typed text", || typed(&f) == want).await;
+    assert_eq!(typed(&f), want, "{:?}", f.lines());
+}
+
+/// Spec risk 6: one find attempt builds a provider (two D-Bus connections
+/// and an X one). Prints the cost; the bound only catches a pathology.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[ignore]
+async fn snapshot_cost_is_measured() {
+    let f = Fixture::start().await;
+    let s = session();
+    let n: u32 = 20;
+    let start = Instant::now();
+    for _ in 0..n {
+        find(&s, f.pid(), "button[name='Remover']").await;
+    }
+    let per = start.elapsed() / n;
+    eprintln!("linux snapshot cost: {per:?} per find attempt");
+    assert!(per < Duration::from_millis(500), "{per:?}");
 }
