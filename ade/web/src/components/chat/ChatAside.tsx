@@ -1,15 +1,20 @@
+import * as DialogPrimitive from '@radix-ui/react-dialog'
 import {
+  ArrowLeft,
   BookmarkPlus,
   Check,
+  ChevronsDownUp,
+  ChevronsUpDown,
   Clock,
   Copy,
+  EllipsisVertical,
   Layers,
   MessageSquareQuote,
   MessagesSquare,
   Trash2,
   X,
 } from 'lucide-react'
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { type ReactNode, useCallback, useEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { BottomSheet, BottomSheetContent } from '@/components/ui/BottomSheet'
 import { Button } from '@/components/ui/Button'
@@ -21,6 +26,7 @@ import { SegmentedControl } from '@/components/ui/ModeToggle'
 import { PageSidebar } from '@/components/ui/PageChrome'
 import { Skeleton } from '@/components/ui/Skeleton'
 import { StatusPanel } from '@/components/ui/StatusPanel'
+import { useVisualViewportFit } from '@/hooks/use-visual-viewport-fit'
 import {
   AUTO_FIX_KEY,
   autoFixRound,
@@ -46,11 +52,17 @@ import {
   withSideChatQuote,
 } from '@/lib/chat-aside'
 import { copyTextToClipboard } from '@/lib/clipboard'
+import {
+  allGroupsFolded,
+  foldAllGroups,
+  useFoldedGroups,
+} from '@/lib/context-groups'
 import { useConversationsCtx } from '@/lib/conversations-context'
 import { errText } from '@/lib/errors'
 import { getIiiClient } from '@/lib/iii-client'
 import { deleteSession, setSessionMeta } from '@/lib/sessions/api'
 import type { SessionMeta, TranscriptItem } from '@/lib/sessions/types'
+import { PortalScope } from '@/lib/ui-scope'
 import type { Conversation } from '@/types/chat'
 import { ChatContextPanel } from './ChatContextPanel'
 import { ChatView } from './ChatView'
@@ -193,9 +205,6 @@ export function ChatAside({
   const [composerKey, setComposerKey] = useState(0)
   const [kept, setKept] = useState<{ id: string } | null>(null)
   const [confirmDiscard, setConfirmDiscard] = useState(false)
-  const mainStarted =
-    conversation.started === true || conversation.messages.length > 0
-
   const { watchConversation } = ctx
   const watchedForkId = fork?.id ?? null
   useEffect(
@@ -342,9 +351,9 @@ export function ChatAside({
       // Choosing the side chat is choosing to type in it.
       setFocusSide(true)
       // Not before the list is in: an existing side chat would go unseen.
-      if (mainStarted && !listLoading) void ensureFork()
+      if (!listLoading) void ensureFork()
     },
-    [setTab, phone, onSheetOpenChange, mainStarted, listLoading, ensureFork],
+    [setTab, phone, onSheetOpenChange, listLoading, ensureFork],
   )
 
   // An outside request (a message's "Ask in side chat", the palette).
@@ -466,11 +475,32 @@ export function ChatAside({
           ) : (
             'Side chat'
           ),
-          icon: <MessagesSquare aria-hidden className="size-4" />,
+          // On a phone the clock says what the dropped "Temporary" row did.
+          icon: phone ? (
+            <Clock aria-hidden className="size-4" />
+          ) : (
+            <MessagesSquare aria-hidden className="size-4" />
+          ),
         },
       ]}
     />
   )
+
+  const allFolded = allGroupsFolded(useFoldedGroups())
+  const foldAll =
+    tab === 'context' ? (
+      <IconButton
+        label={allFolded ? 'Expand all groups' : 'Collapse all groups'}
+        className={phone ? 'size-11 shrink-0' : 'size-7 shrink-0'}
+        onClick={() => foldAllGroups(!allFolded)}
+      >
+        {allFolded ? (
+          <ChevronsUpDown aria-hidden />
+        ) : (
+          <ChevronsDownUp aria-hidden />
+        )}
+      </IconButton>
+    ) : null
 
   const content =
     tab === 'context' ? (
@@ -530,37 +560,39 @@ export function ChatAside({
         ) : null}
         {fork ? (
           <>
-            <div className="flex h-8 shrink-0 items-center gap-1.5 pr-2 pl-4 text-[12px] text-ink-faint">
-              <Clock aria-hidden className="size-4 shrink-0" />
-              <span title={SIDE_CHAT_LIFETIME}>Temporary</span>
-              <span className="min-w-0 truncate text-ink-ghost">
-                · sees the chat up to{' '}
-                <span className="font-mono text-[11px] tabular-nums">
-                  {new Date(since).toLocaleTimeString([], {
-                    hour: '2-digit',
-                    minute: '2-digit',
-                  })}
+            {phone ? null : (
+              <div className="flex h-8 shrink-0 items-center gap-1.5 pr-2 pl-4 text-[12px] text-ink-faint">
+                <Clock aria-hidden className="size-4 shrink-0" />
+                <span title={SIDE_CHAT_LIFETIME}>Temporary</span>
+                <span className="min-w-0 truncate text-ink-ghost">
+                  · sees the chat up to{' '}
+                  <span className="font-mono text-[11px] tabular-nums">
+                    {new Date(since).toLocaleTimeString([], {
+                      hour: '2-digit',
+                      minute: '2-digit',
+                    })}
+                  </span>
                 </span>
-              </span>
-              <span className="flex-1" />
-              <IconButton
-                label="Keep as conversation"
-                disabled={keeping}
-                onClick={() => void keep()}
-              >
-                <BookmarkPlus aria-hidden />
-              </IconButton>
-              <IconButton
-                label="Discard side chat"
-                onClick={() =>
-                  own.some((message) => message.role === 'user')
-                    ? setConfirmDiscard(true)
-                    : discard()
-                }
-              >
-                <Trash2 aria-hidden />
-              </IconButton>
-            </div>
+                <span className="flex-1" />
+                <IconButton
+                  label="Keep as conversation"
+                  disabled={keeping}
+                  onClick={() => void keep()}
+                >
+                  <BookmarkPlus aria-hidden />
+                </IconButton>
+                <IconButton
+                  label="Discard side chat"
+                  onClick={() =>
+                    own.some((message) => message.role === 'user')
+                      ? setConfirmDiscard(true)
+                      : discard()
+                  }
+                >
+                  <Trash2 aria-hidden />
+                </IconButton>
+              </div>
+            )}
             <ChatView
               key={`${fork.id}:${composerKey}`}
               conversation={fork}
@@ -579,6 +611,7 @@ export function ChatAside({
                 },
                 quotes: sent,
                 onJumpToQuote: (quote) => onJumpToMessage(quote.messageId),
+                compact: phone,
               }}
               backend={ctx.backend}
               modelOptions={ctx.modelOptions}
@@ -591,9 +624,11 @@ export function ChatAside({
               onPatchMessage={ctx.updateMessage}
               onCompactConversation={ctx.compactConversation}
             />
-            <p className="shrink-0 px-4 pb-3 text-[11px] leading-4 text-ink-ghost">
-              {SIDE_CHAT_LIFETIME}
-            </p>
+            {phone ? null : (
+              <p className="shrink-0 px-4 pb-3 text-[11px] leading-4 text-ink-ghost">
+                {SIDE_CHAT_LIFETIME}
+              </p>
+            )}
           </>
         ) : forking || forkPending ? (
           <div className="flex flex-col gap-2 px-4 py-3" aria-busy="true">
@@ -620,19 +655,10 @@ export function ChatAside({
         ) : (
           <div className="flex flex-1 flex-col justify-center px-4">
             <SideChatHint
-              action={
-                mainStarted
-                  ? {
-                      label: 'Start side chat',
-                      onClick: () => void ensureFork(),
-                    }
-                  : undefined
-              }
-              description={
-                mainStarted
-                  ? undefined
-                  : 'Send a message in this chat first: the side chat starts from it.'
-              }
+              action={{
+                label: 'Start side chat',
+                onClick: () => void ensureFork(),
+              }}
             />
           </div>
         )}
@@ -650,15 +676,29 @@ export function ChatAside({
 
   if (phone) {
     return (
-      <BottomSheet open={sheetOpen} onOpenChange={onSheetOpenChange}>
-        <BottomSheetContent heading="Side panel" className="h-[85dvh]">
-          {/* Portaled to the body, outside the app's sans default. */}
-          <div className="flex min-h-0 flex-1 flex-col gap-2 font-sans">
-            <div className="flex px-3">{tabs}</div>
-            {content}
-          </div>
-        </BottomSheetContent>
-      </BottomSheet>
+      <PhonePanel
+        open={sheetOpen}
+        onOpenChange={onSheetOpenChange}
+        tabs={tabs}
+        options={
+          tab === 'side-chat' && fork ? (
+            <SideChatOptions
+              since={since}
+              keeping={keeping}
+              onKeep={() => void keep()}
+              onDiscard={() =>
+                own.some((message) => message.role === 'user')
+                  ? setConfirmDiscard(true)
+                  : discard()
+              }
+            />
+          ) : (
+            foldAll
+          )
+        }
+      >
+        {content}
+      </PhonePanel>
     )
   }
 
@@ -677,7 +717,12 @@ export function ChatAside({
       narrowMode="drawer"
       closeDrawerOnSelect={false}
       expandRequest={expandSeq}
-      header={tabs}
+      header={
+        <>
+          {tabs}
+          {foldAll}
+        </>
+      }
       collapsedActions={
         <>
           <IconButton
@@ -714,16 +759,14 @@ export function ChatAside({
 
 function SideChatHint({
   action,
-  description = 'Sees this conversation up to now and has the same tools. Nothing here lands in the main chat.',
 }: {
   action?: { label: string; onClick: () => void }
-  description?: string
 }) {
   return (
     <EmptyState
       icon={MessagesSquare}
       title="Ask on the side"
-      description={description}
+      description="Sees this conversation up to now and has the same tools. Nothing here lands in the main chat."
       action={action}
     />
   )
@@ -733,10 +776,39 @@ function SideChatHint({
 export function QuoteChip({
   quote,
   onRemove,
+  compact = false,
 }: {
   quote: SideChatQuote
   onRemove?: () => void
+  /** One line on a phone, its source in the accessible name. */
+  compact?: boolean
 }) {
+  if (compact) {
+    return (
+      <div
+        className="flex h-10 items-center gap-2 bg-surface pl-3"
+        data-side-chat-quote=""
+      >
+        <MessageSquareQuote
+          aria-hidden
+          className="size-4 shrink-0 text-ink-ghost"
+        />
+        <span className="sr-only">Quoted · {quote.agent || 'Agent'}: </span>
+        <span className="min-w-0 flex-1 truncate text-[13px] text-ink-faint">
+          {quote.text}
+        </span>
+        {onRemove ? (
+          <IconButton
+            label="Remove quote"
+            className="size-10 shrink-0"
+            onClick={onRemove}
+          >
+            <X aria-hidden />
+          </IconButton>
+        ) : null}
+      </div>
+    )
+  }
   return (
     <div
       className="flex items-start gap-2 bg-surface px-3 py-2"
@@ -905,5 +977,142 @@ export function SelectionToolbar({
       </button>
     </div>,
     document.body,
+  )
+}
+
+/**
+ * The side panel on a phone: the whole screen, one bar (back, the tabs, the
+ * side chat's options) and the rest for the content. It follows the visual
+ * viewport, so a raised keyboard shrinks it instead of covering the
+ * composer.
+ */
+function PhonePanel({
+  open,
+  onOpenChange,
+  tabs,
+  options,
+  children,
+}: {
+  open: boolean
+  onOpenChange: (open: boolean) => void
+  tabs: ReactNode
+  options: ReactNode
+  children: ReactNode
+}) {
+  return (
+    <DialogPrimitive.Root open={open} onOpenChange={onOpenChange}>
+      <DialogPrimitive.Portal>
+        <PortalScope>
+          <PhonePanelContent tabs={tabs} options={options}>
+            {children}
+          </PhonePanelContent>
+        </PortalScope>
+      </DialogPrimitive.Portal>
+    </DialogPrimitive.Root>
+  )
+}
+
+function PhonePanelContent({
+  tabs,
+  options,
+  children,
+}: {
+  tabs: ReactNode
+  options: ReactNode
+  children: ReactNode
+}) {
+  // Mounted only while open, so the fit starts with the panel on screen.
+  const ref = useRef<HTMLDivElement>(null)
+  useVisualViewportFit(ref)
+  return (
+    <DialogPrimitive.Content
+      ref={ref}
+      aria-describedby={undefined}
+      data-side-panel-phone=""
+      className="fixed inset-x-0 top-0 z-50 flex h-dvh flex-col bg-panel pt-[env(safe-area-inset-top)] pb-[env(safe-area-inset-bottom)] font-sans text-ink focus:outline-none"
+    >
+      <DialogPrimitive.Title className="sr-only">
+        Side panel
+      </DialogPrimitive.Title>
+      <div className="flex h-13 shrink-0 items-center gap-1 border-b border-rule-2 bg-panel-raised px-1">
+        <DialogPrimitive.Close asChild>
+          <IconButton label="Back to the chat" className="size-11 shrink-0">
+            <ArrowLeft aria-hidden />
+          </IconButton>
+        </DialogPrimitive.Close>
+        <div className="flex min-w-0 flex-1">{tabs}</div>
+        {options ?? <span className="size-11 shrink-0" aria-hidden />}
+      </div>
+      <div className="flex min-h-0 flex-1 flex-col">{children}</div>
+    </DialogPrimitive.Content>
+  )
+}
+
+/**
+ * The side chat's options on a phone, behind ⋮: what the desktop shows in
+ * its "Temporary" row and footer (when it ends) plus Keep and Discard.
+ */
+function SideChatOptions({
+  since,
+  keeping,
+  onKeep,
+  onDiscard,
+}: {
+  since: number
+  keeping: boolean
+  onKeep: () => void
+  onDiscard: () => void
+}) {
+  const [open, setOpen] = useState(false)
+  const row =
+    'flex h-12 w-full items-center gap-3 rounded-md px-3 text-left text-base hover:bg-surface-hover focus-visible:outline-2 focus-visible:outline-accent disabled:opacity-50 [&>svg]:size-[18px] [&>svg]:shrink-0'
+  return (
+    <>
+      <IconButton
+        label="Side chat options"
+        className="size-11 shrink-0"
+        onClick={() => setOpen(true)}
+      >
+        <EllipsisVertical aria-hidden />
+      </IconButton>
+      <BottomSheet open={open} onOpenChange={setOpen}>
+        <BottomSheetContent
+          heading="Temporary side chat"
+          description={`Sees the chat up to ${new Date(
+            since,
+          ).toLocaleTimeString([], {
+            hour: '2-digit',
+            minute: '2-digit',
+          })}. ${SIDE_CHAT_LIFETIME}`}
+          className="mx-auto max-w-[460px] font-sans"
+        >
+          <div className="flex flex-col gap-1 px-2 pb-1">
+            <button
+              type="button"
+              className={row}
+              disabled={keeping}
+              onClick={() => {
+                setOpen(false)
+                onKeep()
+              }}
+            >
+              <BookmarkPlus aria-hidden className="text-ink-faint" />
+              Keep as conversation
+            </button>
+            <button
+              type="button"
+              className={`${row} text-alert`}
+              onClick={() => {
+                setOpen(false)
+                onDiscard()
+              }}
+            >
+              <Trash2 aria-hidden />
+              Discard side chat…
+            </button>
+          </div>
+        </BottomSheetContent>
+      </BottomSheet>
+    </>
   )
 }

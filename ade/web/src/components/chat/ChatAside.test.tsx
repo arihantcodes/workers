@@ -5,6 +5,7 @@ import { createRoot, type Root } from 'react-dom/client'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { TooltipProvider } from '@/components/ui/Tooltip'
 import { type SideChatQuote, sideChatsMadeHere } from '@/lib/chat-aside'
+import { resetFoldedGroups } from '@/lib/context-groups'
 import type { Conversation } from '@/types/chat'
 import type { AsideRequest } from './ChatAside'
 
@@ -39,12 +40,14 @@ vi.mock('./ChatView', () => ({
       autoFocus?: boolean
       quote?: SideChatQuote | null
       onQuoteSent?: (quote: SideChatQuote) => void
+      compact?: boolean
     }
   }) => (
     <div
       data-side-chat={conversation.id}
       data-autofocus={String(side?.autoFocus ?? false)}
       data-quote={side?.quote?.text ?? ''}
+      data-compact={String(side?.compact ?? false)}
     >
       <button
         type="button"
@@ -114,6 +117,7 @@ let container: HTMLElement | null = null
 
 const pending = vi.fn()
 let pendingQuote: SideChatQuote | null = null
+let phone = false
 
 function render(
   request: AsideRequest | null = null,
@@ -131,8 +135,8 @@ function render(
         <ChatAside
           conversation={conversation}
           side="right"
-          phone={false}
-          sheetOpen={false}
+          phone={phone}
+          sheetOpen={phone}
           onSheetOpenChange={() => {}}
           request={request}
           triggers={[]}
@@ -194,7 +198,9 @@ const forked = (metadata: Record<string, unknown> = {}) => ({
 beforeEach(() => {
   pending.mockReset()
   pendingQuote = null
+  phone = false
   window.localStorage.clear()
+  resetFoldedGroups()
   sideChatsMadeHere.clear()
   mocks.trigger.mockReset()
   mocks.setSessionMeta.mockReset()
@@ -384,6 +390,48 @@ describe('ChatAside side chat', () => {
   })
 })
 
+describe('ChatAside on a phone', () => {
+  beforeEach(() => {
+    phone = true
+    window.localStorage.setItem('iii-chat-aside-tab', 'side-chat')
+  })
+
+  it('takes the screen with one bar: back, tabs and options', () => {
+    mocks.ctx = makeCtx([main, fork])
+    render()
+    const panel = document.querySelector('[data-side-panel-phone]')
+    expect(panel?.getAttribute('role')).toBe('dialog')
+    expect(button('Back to the chat')).toBeDefined()
+    expect(button('Side chat options')).toBeDefined()
+    expect(
+      panel
+        ?.querySelector('[data-side-chat="fork-1"]')
+        ?.getAttribute('data-compact'),
+    ).toBe('true')
+    // The lifetime moved into the options sheet.
+    expect(panel?.textContent).not.toContain('Deleted after')
+    expect(button('Keep as conversation')).toBeUndefined()
+  })
+
+  it('keeps or discards from the options sheet', async () => {
+    const ctx = makeCtx([main, fork])
+    mocks.ctx = ctx
+    render()
+    act(() => button('Side chat options')?.click())
+    expect(document.body.textContent).toContain('Deleted after')
+    act(() => button('Discard side chat…')?.click())
+    expect(ctx.remove).toHaveBeenCalledWith('fork-1')
+  })
+
+  it('has no options while there is no side chat', () => {
+    mocks.ctx = makeCtx([main])
+    window.localStorage.setItem('iii-chat-aside-tab', 'context')
+    render()
+    expect(button('Back to the chat')).toBeDefined()
+    expect(button('Side chat options')).toBeUndefined()
+  })
+})
+
 describe('ChatAside unread reply', () => {
   const answered = (count: number) =>
     chat('fork-1', {
@@ -455,6 +503,16 @@ describe('ChatAside context', () => {
     act(() => button('collapse Side panel')?.click())
     await settle()
     expect(panel()?.getAttribute('data-active')).not.toBe('true')
+  })
+  it('folds and unfolds every Context group', () => {
+    mocks.ctx = makeCtx([main])
+    render()
+    act(() => button('Collapse all groups')?.click())
+    expect(
+      JSON.parse(window.localStorage.getItem('iii-context-collapsed') ?? '[]'),
+    ).toContain('links')
+    act(() => button('Expand all groups')?.click())
+    expect(window.localStorage.getItem('iii-context-collapsed')).toBe('[]')
   })
 })
 
