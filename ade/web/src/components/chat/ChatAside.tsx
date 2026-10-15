@@ -21,9 +21,19 @@ import { SegmentedControl } from '@/components/ui/ModeToggle'
 import { PageSidebar } from '@/components/ui/PageChrome'
 import { Skeleton } from '@/components/ui/Skeleton'
 import { StatusPanel } from '@/components/ui/StatusPanel'
+import {
+  AUTO_FIX_KEY,
+  autoFixRound,
+  autoFixState,
+  ghViewer,
+} from '@/lib/auto-fix'
 import type { SessionTriggerInfo } from '@/lib/backend/triggers'
 import {
+  DISMISSED_PRS_KEY,
+  dismissedPullRequests,
   findSideChat,
+  folderGh,
+  githubWorkerGh,
   lastSpokenEntry,
   SIDE_CHAT_KEY,
   SIDE_CHAT_QUOTES_KEY,
@@ -56,6 +66,8 @@ export interface AsideRequest {
 }
 
 const TAB_STORAGE_KEY = 'iii-chat-aside-tab'
+/** How often auto-fix reads a watched PR while the chat is open. */
+const AUTO_FIX_EVERY_MS = 90_000
 
 /** When a side chat ends on its own (ChatPanel runs the rules). */
 const SIDE_CHAT_LIFETIME =
@@ -96,6 +108,8 @@ interface ChatAsideProps {
   onPendingQuoteChange: (quote: SideChatQuote | null) => void
   /** Land the main chat on a message (a quote card's way back). */
   onJumpToMessage: (messageId: string) => void
+  /** Hand the main chat's agent an instruction (see ChatContextPanel). */
+  onAskAgent?: (text: string, send: boolean) => void
 }
 
 /**
@@ -117,6 +131,7 @@ export function ChatAside({
   pendingQuote,
   onPendingQuoteChange,
   onJumpToMessage,
+  onAskAgent,
 }: ChatAsideProps) {
   const ctx = useConversationsCtx()
   const [tab, setTabState] = useState<AsideTab>(readStoredTab)
@@ -168,7 +183,10 @@ export function ChatAside({
   const forkRef = useRef(fork)
   forkRef.current = fork
   const [focusSide, setFocusSide] = useState(false)
-  const [actionError, setActionError] = useState<string | null>(null)
+  const [actionError, setActionError] = useState<{
+    headline: string
+    detail: string
+  } | null>(null)
   const [forking, setForking] = useState(false)
   const [forkError, setForkError] = useState<string | null>(null)
   const forkingRef = useRef<Promise<string | null> | null>(null)
@@ -247,6 +265,74 @@ export function ChatAside({
     return run
   }, [conversation.id, conversation.title])
 
+  // Auto-fix rounds while this chat is open: one tab at a time (a Web Lock
+  // per chat), never while the agent is working, and what was reported
+  // kept in the session so every tab shares it (lib/auto-fix).
+  const watching = Object.keys(autoFixState(conversation)).sort().join()
+  const conversationRef = useRef(conversation)
+  conversationRef.current = conversation
+  const askRef = useRef(onAskAgent)
+  askRef.current = onAskAgent
+  const { githubAvailable, shellAvailable, setSessionMetadata } = ctx
+  const workingDir = conversation.workingDir ?? null
+  useEffect(() => {
+    const ghReach = githubAvailable
+      ? 'worker'
+      : shellAvailable && workingDir
+        ? 'folder'
+        : null
+    if (!watching || !ghReach) return
+    let alive = true
+    let viewer: string | null | undefined
+    const run = async () => {
+      const current = conversationRef.current
+      const state = autoFixState(current)
+      if (!askRef.current || current.status === 'working') return
+      if (Object.keys(state).length === 0) return
+      const client = await getIiiClient()
+      const trigger = client.trigger.bind(client)
+      const gh =
+        ghReach === 'folder' && workingDir
+          ? folderGh(trigger, workingDir)
+          : githubWorkerGh(trigger)
+      viewer ??= await ghViewer(gh)
+      const { next, message } = await autoFixRound(gh, state, viewer)
+      if (!alive) return
+      if (JSON.stringify(next) !== JSON.stringify(state)) {
+        setSessionMetadata(current.id, { [AUTO_FIX_KEY]: next })
+      }
+      if (message) askRef.current?.(message, true)
+    }
+    const round = async () => {
+      const locks =
+        typeof navigator === 'undefined' ? undefined : navigator.locks
+      if (!locks) return run()
+      await locks.request(
+        `iii-ade-autofix:${conversationRef.current.id}`,
+        { ifAvailable: true },
+        async (lock) => {
+          if (lock) await run()
+        },
+      )
+    }
+    void round().catch(() => {})
+    const timer = window.setInterval(
+      () => void round().catch(() => {}),
+      AUTO_FIX_EVERY_MS,
+    )
+    return () => {
+      alive = false
+      window.clearInterval(timer)
+    }
+  }, [
+    watching,
+    githubAvailable,
+    shellAvailable,
+    workingDir,
+    setSessionMetadata,
+  ])
+
+  const listLoading = ctx.conversationsLoading === true
   const show = useCallback(
     (next: AsideTab) => {
       setTab(next)
@@ -255,9 +341,10 @@ export function ChatAside({
       if (next !== 'side-chat') return
       // Choosing the side chat is choosing to type in it.
       setFocusSide(true)
-      if (mainStarted) void ensureFork()
+      // Not before the list is in: an existing side chat would go unseen.
+      if (mainStarted && !listLoading) void ensureFork()
     },
-    [setTab, phone, onSheetOpenChange, mainStarted, ensureFork],
+    [setTab, phone, onSheetOpenChange, mainStarted, listLoading, ensureFork],
   )
 
   // An outside request (a message's "Ask in side chat", the palette).
@@ -274,12 +361,27 @@ export function ChatAside({
     })
   }, [request, show, ensureFork])
 
-  const keep = () => {
-    if (!fork) return
-    ctx.setSessionMetadata(fork.id, { [SIDE_CHAT_KEY]: undefined })
-    sideChatsMadeHere.delete(fork.id)
+  // Kept only once the server dropped the tag: a write lost on the way
+  // would bring it back, hidden, for the sweep to delete.
+  const [keeping, setKeeping] = useState(false)
+  const keep = async () => {
+    if (!fork || keeping) return
+    const target = fork
+    const { [SIDE_CHAT_KEY]: _tag, ...metadata } = target.sessionMetadata ?? {}
+    setKeeping(true)
+    setActionError(null)
+    try {
+      await setSessionMeta({ session_id: target.id, metadata })
+    } catch (error) {
+      setActionError({ headline: 'Side chat not kept', detail: errText(error) })
+      return
+    } finally {
+      setKeeping(false)
+    }
+    ctx.setSessionMetadata(target.id, { [SIDE_CHAT_KEY]: undefined })
+    sideChatsMadeHere.delete(target.id)
     onPendingQuoteChange(null)
-    setKept({ id: fork.id })
+    setKept({ id: target.id })
     setForkId(null)
   }
   const discard = () => {
@@ -300,7 +402,10 @@ export function ChatAside({
     sideChatsMadeHere.delete(target.id)
     void ctx.remove(target.id).catch((error) => {
       hide(false)
-      setActionError(errText(error))
+      setActionError({
+        headline: 'Side chat not discarded',
+        detail: errText(error),
+      })
     })
   }
 
@@ -308,6 +413,10 @@ export function ChatAside({
   const sent = sideChatQuotes(fork)
   const from = sideChatFrom(fork)
   const own = fork ? sideChatMessages(fork.messages, since, from) : []
+  // Only an answer counts as news: the turn's notes and tool rows land first.
+  const replies = own.filter(
+    (message) => message.role === 'assistant' && message.content.trim(),
+  ).length
 
   // A reply that lands while the side chat is out of sight marks its tab and
   // icon. Counted from when its transcript first loads here: coming back to
@@ -320,14 +429,14 @@ export function ChatAside({
     setSeen((current) =>
       current?.id === loadedForkId && !sideVisible
         ? current
-        : { id: loadedForkId, count: own.length },
+        : { id: loadedForkId, count: replies },
     )
-  }, [loadedForkId, sideVisible, own.length])
+  }, [loadedForkId, sideVisible, replies])
   const unread =
     !sideVisible &&
     seen !== null &&
     seen.id === loadedForkId &&
-    own.length > seen.count
+    replies > seen.count
 
   const tabs = (
     <SegmentedControl<AsideTab>
@@ -375,6 +484,18 @@ export function ChatAside({
         shellAvailable={ctx.shellAvailable}
         githubAvailable={ctx.githubAvailable}
         kanbanAvailable={ctx.kanbanAvailable}
+        onAskAgent={onAskAgent}
+        onAutoFixChange={(key, seen) => {
+          const { [key]: _old, ...rest } = autoFixState(conversation)
+          ctx.setSessionMetadata(conversation.id, {
+            [AUTO_FIX_KEY]: seen ? { ...rest, [key]: seen } : rest,
+          })
+        }}
+        onDismissPullRequest={(key) =>
+          ctx.setSessionMetadata(conversation.id, {
+            [DISMISSED_PRS_KEY]: [...dismissedPullRequests(conversation), key],
+          })
+        }
         landBlocked={landBlocked}
         active={visible}
       />
@@ -385,8 +506,8 @@ export function ChatAside({
             variant="alert"
             role="alert"
             className="mx-2 mb-2"
-            headline="Side chat not discarded"
-            detail={actionError}
+            headline={actionError.headline}
+            detail={actionError.detail}
           />
         ) : null}
         {kept ? (
@@ -422,7 +543,11 @@ export function ChatAside({
                 </span>
               </span>
               <span className="flex-1" />
-              <IconButton label="Keep as conversation" onClick={keep}>
+              <IconButton
+                label="Keep as conversation"
+                disabled={keeping}
+                onClick={() => void keep()}
+              >
                 <BookmarkPlus aria-hidden />
               </IconButton>
               <IconButton
@@ -682,8 +807,11 @@ export function SelectionToolbar({
           picked &&
           picked.rect.bottom > picked.bounds.top &&
           picked.rect.top < picked.bounds.bottom
-        setShown(visible ? picked : null)
-        if (!picked) setCopied(false)
+        setShown((current) => {
+          // "Copied" belongs to the text it copied.
+          if (current?.quote.text !== picked?.quote.text) setCopied(false)
+          return visible ? picked : null
+        })
       })
     }
     const down = (event: PointerEvent) => {
