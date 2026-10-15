@@ -2,7 +2,7 @@
 
 [package]
 name = "ade"
-version = "1.9.61"
+version = "1.9.62"
 edition = "2021"
 publish = false
 
