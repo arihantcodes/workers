@@ -198,28 +198,32 @@ export function attachOrder(tickets: TicketSummary[], reasons: Map<string, strin
 
 /* ── subtasks of a ticket ────────────────────────────────────────────── */
 
-export const openChildren = (children: Brief[], doneStatus: string): Brief[] =>
-  children.filter((child) => !child.deleted_at && child.status !== doneStatus)
+/** Live children that are neither done nor canceled. */
+export const openChildren = (children: Brief[], doneStatus: string, canceledStatus: string | null): Brief[] =>
+  children.filter((child) => !child.deleted_at && child.status !== doneStatus && child.status !== canceledStatus)
 
 export function progressPercent(progress: { done: number; total: number }): number {
   return progress.total > 0 ? Math.min(100, Math.round((progress.done / progress.total) * 100)) : 0
 }
 
-/** The column just before `id`, where a parent returns to when it was closed too early. */
-export function columnBefore(columns: Column[], id: string): Column | null {
+/** The nearest column before `id` that is not `skip`, where a parent returns to when it was closed too early. */
+export function columnBefore(columns: Column[], id: string, skip: string | null = null): Column | null {
   const index = columns.findIndex((column) => column.id === id)
-  return index > 0 ? (columns[index - 1] ?? null) : null
+  for (let at = index - 1; at >= 0; at -= 1) if (columns[at]?.id !== skip) return columns[at] ?? null
+  return null
 }
 
 /** A ticket in the done column with subtasks still open: the open ones and where "Move back" goes. */
 export function doneWarning(
   ticket: Pick<Ticket, 'status' | 'children' | 'deleted_at'>,
   doneStatus: string,
+  canceledStatus: string | null,
   columns: Column[],
 ): { open: Brief[]; back: Column | null } | null {
   if (ticket.deleted_at || ticket.status !== doneStatus) return null
-  const open = openChildren(ticket.children, doneStatus)
-  return open.length > 0 ? { open, back: columnBefore(columns, doneStatus) } : null
+  const open = openChildren(ticket.children, doneStatus, canceledStatus)
+  // Never "back" into the canceled column: that would close the parent instead of reopening it.
+  return open.length > 0 ? { open, back: columnBefore(columns, doneStatus, canceledStatus) } : null
 }
 
 /** The neighbours of a subtask among its parent's, in the parent's order. */
