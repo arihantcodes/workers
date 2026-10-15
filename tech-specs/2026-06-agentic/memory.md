@@ -55,9 +55,12 @@ One LLM call per completed turn, off the hot path:
    fingerprint-deduped, capped per pass (`rule_learning_enabled` to disable). Hand-authored rules
    are never touched by any automatic path.
 
-Embeddings are derived data: `vectors.jsonl` sidecars carry the memory revision and embedding
-model; an edit or a model change invalidates the vector and background backfill re-embeds through
-`router::embed`. Loss of a sidecar costs a re-embed, never memory integrity.
+Embeddings are derived data: `vectors.jsonl` sidecars carry the embedded text and embedding
+model. A text edit, a retirement, or a newly pinned `embedding_model` invalidates the vector;
+reinforcement, pins, and tag edits do not, and an empty `embedding_model` (the provider default)
+accepts existing vectors. Background backfill — on save, edit, and extraction, plus a sweep every
+minute — re-embeds through `router::embed`. Loss of a sidecar costs a re-embed, never memory
+integrity.
 
 ## Functions
 
