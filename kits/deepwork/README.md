@@ -7,7 +7,7 @@ Give **Deepwork** a goal and a team of agents works it, with the kanban board as
 3. Leads run in parallel, in waves.
 4. Rounds repeat until the goal is done, nothing is left, progress stalls, rounds run out or the budget is spent.
 
-A goal that changes code in a git repository runs the **dev flow**. You approve the design and the plan. Each code ticket is written test-first in a git worktree, with one commit. Every commit is verified and reviewed, then the whole branch is reviewed, and you choose how it finishes. Other goals (research, reading, analysis) run the **plain flow**: work, then verify.
+A goal that changes code in a git repository runs the **dev flow**. You approve the design and the plan. Each code ticket is written test-first in its own git worktree, with one commit. Every commit is verified and reviewed (with `verify=off`, accepted as written), then landed on the run branch. The whole branch is reviewed, and you choose how it finishes. Other goals (research, reading, analysis) run the **plain flow**: you approve the plan and each ticket is worked and verified. When at least two tickets finish with a result, and the run was not stopped, blocked or over budget, one last ticket merges the results into a single verified report that cites the ticket behind every claim (`synthesize=off` turns it off).
 
 Deepwork needs only the `harness`, `state`, `kanban` and `ide` workers.
 
@@ -63,10 +63,13 @@ args: max_rounds=2 concurrency=4 budget_usd=5
 | Arg | Default | What it does |
 |---|---|---|
 | `flow` | `auto` | `dev` for code goals in a git repository, `plain` for the rest. Set it to force one |
-| `approve` | on | in the dev flow, waits for you on the design, the plan and the finish. `off` runs straight through and keeps the branch |
+| `approve` | on | waits for you on open design questions and on the plan, and in the dev flow on the finish. `off` runs straight through and keeps the branch |
+| `synthesize` | on | in the plain flow, ends the run with one ticket that merges the done tickets' results into a single report, verified like any other ticket. It runs when at least two tickets are done, and not after a stop, a block or the budget. `off` reports per ticket |
+| `plan_only` | off | `on` plans and stops: the run ticket and its cards go on the board, nothing runs. Edit the cards, then start with `resume=<R>` |
+| `isolation` | `ticket` | in the dev flow, each code ticket works in its own worktree, branched from the run branch and landed on it when verified. `shared` runs every ticket in the run worktree, so tickets that share a file or a test target wait for a later wave |
 | `max_rounds` | 3 | rounds over the queue |
 | `attempts` | 2 | tries per ticket per round. A rejected try is retried with the reasons |
-| `concurrency` | 8 | leads per wave, at most 8. A ticket waits for its `Depends on:` tickets. In the dev flow, tickets that share a file never share a wave |
+| `concurrency` | 8 | leads per wave, at most 8. A ticket waits for its `Depends on:` tickets. With `isolation=shared`, tickets that share a file never share a wave |
 | `verify` | on | checks each ticket |
 | `verifier` | `deepwork-adversary` | the checker profile: `deepwork-adversary*` or `deepwork-verifier*` |
 | `judges` | – | comma-separated model ids. One `deepwork-verifier` per model checks each ticket and the majority wins. At most 7 in the dev flow, 8 in the plain flow |
@@ -77,6 +80,7 @@ args: max_rounds=2 concurrency=4 budget_usd=5
 | `notify` | – | a function id that gets the final report, such as a Slack or email send |
 | `project` | – | an existing kanban project (id or name) for the run. Without it, each run creates its own project, `deepwork: <goal> · <id>` |
 | `release` | – | an existing kanban release (id or name). Agents can't create releases |
+| `resume` | – | the key of an earlier run ticket to pick up from the board instead of planning anew (see Resume a run) |
 
 ### Hard cost cap
 
@@ -92,17 +96,18 @@ You must pass `model`, because the profile sets none. Every model the run uses n
 
 1. **Design.** Deepwork reads the repository and asks about anything the code can't answer. It asks one question at a time and offers two or three options, with its own pick first.
 2. **Plan.** The design goes on the run ticket. Each task becomes a subtask with `Files:`, `Test first:`, `Implement:`, `Verify:` and `Commit:` lines. You answer one card: Start, Stop, or type your changes. If you type changes, Deepwork rewrites the plan and asks again.
-3. **Worktree.** The work happens on a new branch, `deepwork/<slug>`, in `.worktrees/<slug>`. That folder is excluded locally, so your checkout is untouched. Run Deepwork from the repository's top folder. The test suite runs once to get a baseline.
-4. **Code tickets.** Each code ticket follows three steps:
+3. **Worktree.** The run gets a new branch, `deepwork/<slug>`, in `.worktrees/<slug>`. That folder is excluded locally, so your checkout is untouched. Run Deepwork from the repository's top folder. The test suite runs once to get a baseline. Each code ticket then works in its own worktree, `.worktrees/<slug>-<key>`, on a branch off the run branch. A fresh copy may need an install step before it builds (a Node project): Deepwork reads it from the repository and runs it in each ticket worktree. Build output is never shared between worktrees, so a compiled project builds once per ticket.
+4. **Code tickets.** Each code ticket follows four steps:
    1. Write a failing test.
    2. Write the least code that makes it pass, and commit once.
    3. Verify and review the commit, side by side. Verify re-runs the `Verify:` lines. Review checks that the tests are unchanged and nothing outside `Files:` moved.
+   4. Land the commit on the run branch. A conflict with a sibling is a rejection, retried next round on the new base.
 
    A rejection goes back to the same code session with the reasons. Research tickets in the same run are worked and verified without a commit.
 5. **Branch review.** Once the queue is empty, one reviewer runs the full test suite and the linter and reviews the whole diff. Its findings become tickets for the next round.
 6. **Finish.** You pick one: merge into your branch, push and open a PR, keep the branch, or discard it.
 
-Sub-agents work only inside the worktree. They never push, merge, rebase, reset, switch, stash or clean. Deepwork pushes or merges only when you pick that at the finish. Loose ends the goal doesn't need become Backlog subtasks labelled `pending`.
+Sub-agents work only inside their worktree. They never push, merge, rebase, reset, switch, stash or clean. Deepwork pushes or merges only when you pick that at the finish. Loose ends the goal doesn't need become Backlog subtasks labelled `pending`.
 
 ## The board
 
@@ -115,6 +120,7 @@ Sub-agents work only inside the worktree. They never push, merge, rebase, reset,
   - reorder To do;
   - comment on a ticket to steer its retry;
   - move a Backlog card to To do to run it again.
+- **Resume a run.** If the orchestrator's session is lost (the console closed it, the engine restarted), start Deepwork again with `args: resume=<R>`. It adopts the run ticket: the goal, args, branch and worktree come from the card, In progress tickets whose lead is gone go back to To do, and the rounds continue from where they stopped; `max_rounds` then counts the rounds this resume runs. A finished run can be resumed the same way once you move cards to To do, as long as its worktree still exists.
 - **Skip a ticket.** Move it from To do to Backlog. Don't drag In progress cards, because Deepwork's next write overrides your move. Deleting a card removes it from the run.
 - **Outcomes.**
   - Done tickets carry `verified` or `accepted`.
@@ -135,7 +141,7 @@ Sub-agents work only inside the worktree. They never push, merge, rebase, reset,
   | the harness | `state::barrier` |
   | orchestrator | `harness::spawn`, `harness::metrics`, `harness::stop`, `state::compare-and-set`, `kanban::ticket::list`, `kanban::project::create`, `shell::exec`, plus `directory::agents::get` with `judges=` |
   | leads | `harness::spawn`, `harness::status`, `harness::stop`, `engine::register_trigger`, `state::list`, `state::compare-and-set`, `kanban::comment::create` |
-  | phase sub-agents | `state::compare-and-set`, `kanban::ticket::get`, `kanban::comment::create`, `shell::exec`, `coder::read-file`, plus whatever the work needs. `deepwork-impl` also needs `coder::create-file` and `coder::update-file`. Checkers also need `state::get` |
+  | phase sub-agents | `state::compare-and-set`, `kanban::ticket::get`, `kanban::comment::create`, `shell::exec`, `coder::read-file`, plus whatever the work needs. `deepwork-impl` also needs `coder::create-file` and `coder::update-file`. Checkers, and the worker of the plain flow's synthesis ticket, also need `state::get` |
 
   A phase call that waits for approval parks its ticket as `blocked`. If every lead in a wave waits for approval, the run ends as `blocked`.
 - **`harness::stop`.** The repository rules (`iii-permissions.yaml`) deny it with a `'!harness::stop'` line. To allow it, remove that line and add `- harness::stop`. An allow above the deny line is not enough, because the console makes every deny rule session-wide. If you keep the deny, leads that time out are parked as `stuck`.
@@ -161,4 +167,4 @@ Sub-agents work only inside the worktree. They never push, merge, rebase, reset,
 
 Results go through `state` rather than kanban events. State has compare-and-set, and a kanban outage won't lose results.
 
-Not in 0.2: a hard cost cap from the console, and one worktree per ticket. Tickets that share a file wait for a later wave instead.
+Not yet: a hard cost cap from the console.
