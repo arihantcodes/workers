@@ -12,6 +12,7 @@ import type {
   ComposerControlRegistration,
   ConfigFormLayout,
   ConfigFormProps,
+  ContextSectionRegistration,
   FunctionTriggerRenderer,
   MentionRendererRegistration,
   OverlayRegistration,
@@ -71,6 +72,24 @@ export interface RegisteredSessionTurnSummary
   scope: string
   path: string
 }
+
+export interface RegisteredContextSection extends ContextSectionRegistration {
+  scope: string
+  path: string
+  /** Numbers each registration, so a replaced one renders afresh. */
+  registrationId: number
+}
+
+/** The Context panel's own sections, in their default order. */
+export const CONTEXT_PANEL_GROUPS = [
+  'project',
+  'tickets',
+  'prs',
+  'assets',
+  'subagents',
+  'triggers',
+  'links',
+] as const
 
 export interface RegisteredComposerAction extends ComposerActionRegistration {
   scope: string
@@ -163,6 +182,8 @@ const configFormsStore = createStore<RegisteredConfigForm>()
 const providerConfigFormsStore = createStore<RegisteredProviderConfigForm>()
 const sessionChipsStore = createStore<RegisteredSessionChip>()
 const sessionTurnSummariesStore = createStore<RegisteredSessionTurnSummary>()
+const contextSectionsStore = createStore<RegisteredContextSection>()
+let lastContextSectionRegistration = 0
 const composerActionsStore = createStore<RegisteredComposerAction>()
 const composerControlsStore = createStore<RegisteredComposerControl>()
 const overlaysStore = createStore<RegisteredOverlay>()
@@ -511,6 +532,50 @@ export function useExtSessionTurnSummaries(): readonly RegisteredSessionTurnSumm
     () => EMPTY,
   )
   return useMemo(() => dedupeSessionTurnSummaries(summaries), [summaries])
+}
+
+/**
+ * Duplicate section id: last registration wins in the Context panel. The
+ * panel's own ids are refused: a worker cannot replace them.
+ */
+export function registerExtContextSection(
+  entry: Omit<RegisteredContextSection, 'registrationId'>,
+): () => void {
+  if ((CONTEXT_PANEL_GROUPS as readonly string[]).includes(entry.id)) {
+    console.warn(
+      `[iii-ui] context section id '${entry.id}' from '${entry.path}' is ` +
+        "one of the panel's own; it is ignored",
+    )
+    return () => {}
+  }
+  const duplicate = contextSectionsStore
+    .get()
+    .find((section) => section.id === entry.id)
+  if (duplicate && duplicate.path !== entry.path) {
+    console.warn(
+      `[iii-ui] duplicate context section id '${entry.id}' - ` +
+        `'${entry.path}' overrides '${duplicate.path}'`,
+    )
+  }
+  lastContextSectionRegistration += 1
+  return contextSectionsStore.add({
+    ...entry,
+    registrationId: lastContextSectionRegistration,
+  })
+}
+
+/** Workers' Context panel sections deduplicated by id; last registration wins. */
+export function useExtContextSections(): readonly RegisteredContextSection[] {
+  const sections = useSyncExternalStore(
+    contextSectionsStore.subscribe,
+    contextSectionsStore.get,
+    () => EMPTY,
+  )
+  return useMemo(() => {
+    const byId = new Map<string, RegisteredContextSection>()
+    for (const section of sections) byId.set(section.id, section)
+    return [...byId.values()]
+  }, [sections])
 }
 
 function dedupeComposerActions(
