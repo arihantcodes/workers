@@ -690,7 +690,7 @@ dependencies = [
 
 [[package]]
 name = "iii-acp"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "anyhow",
  "clap",
