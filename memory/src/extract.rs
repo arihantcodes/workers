@@ -18,7 +18,7 @@
 //! LLM never re-pays for content it already saw. The cursor advances only
 //! after a successful pass, so a failed call retries over the same span.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, LazyLock, Mutex};
 
 use iii_sdk::errors::Error;
@@ -30,7 +30,7 @@ use serde_json::{json, Value};
 use crate::deps::Deps;
 use crate::events::ItemEvent;
 use crate::hooks::ExtractJobInput;
-use crate::store::CommitKind;
+use crate::store::{CommitKind, Store};
 use crate::types::{fingerprint, local_date, now_ms, Confidence, Memory, Provenance};
 
 const EXTRACT_SYSTEM: &str = "You extract durable memories from a conversation excerpt.\n\
@@ -108,21 +108,49 @@ impl ExtractedItem {
 const MAX_KNOWN: usize = 12;
 
 /// What the bank already holds about an excerpt: lexical recall over its
-/// message text. A bank that does not exist yet holds nothing.
+/// message text, then up to half as many of the memories about the user of
+/// the `layer` read under it, so a restated one is reinforced and a
+/// corrected one superseded where it lives instead of copied into this
+/// bank. A bank that does not exist yet holds nothing. Returns the ids the
+/// layer holds too.
 async fn known_memories(
-    deps: &Deps,
+    store: &Store,
     bank_name: &str,
+    layer: Option<&str>,
     query: &str,
     half_life_days: u64,
-) -> Vec<Memory> {
-    let Ok(bank) = deps.store().await.bank(bank_name).await else {
-        return Vec::new();
+) -> (Vec<Memory>, HashSet<String>) {
+    let mut known: Vec<Memory> = match store.bank(bank_name).await {
+        Ok(bank) => bank
+            .recall(query, None, "", MAX_KNOWN, half_life_days, false)
+            .await
+            .into_iter()
+            .map(|(m, _)| m)
+            .collect(),
+        Err(_) => Vec::new(),
     };
-    bank.recall(query, None, "", MAX_KNOWN, half_life_days, false)
+    let layer = match layer {
+        Some(name) => store.bank(name).await.ok(),
+        None => None,
+    };
+    let Some(layer) = layer else {
+        return (known, HashSet::new());
+    };
+    // After the bank's own, never in place of them: BM25 idf is per bank,
+    // so a small layer's scores would push out a fact this bank must be
+    // able to correct.
+    let own: HashSet<String> = known.iter().map(|m| m.id.clone()).collect();
+    let extra: Vec<Memory> = layer
+        .recall(query, None, "", usize::MAX, half_life_days, false)
         .await
         .into_iter()
         .map(|(m, _)| m)
-        .collect()
+        .filter(|m| crate::scope::in_layer(m) && !own.contains(&m.id))
+        .take(MAX_KNOWN / 2)
+        .collect();
+    let layered = extra.iter().map(|m| m.id.clone()).collect();
+    known.extend(extra);
+    (known, layered)
 }
 
 /// The extraction model's input: the numbered known memories, then the
@@ -292,14 +320,27 @@ pub async fn try_run(deps: &Deps, job: &ExtractJobInput) -> Result<(), String> {
     let pass = session_pass(session_id);
     let _pass = pass.lock().await;
     let cfg = deps.config().await;
-    let bank_name = match (&job.bank, job.skip) {
+    let resolved = match (&job.bank, job.skip) {
         (_, true) => None,
-        (Some(bank), false) => Some(bank.clone()),
+        (Some(bank), false) => Some(crate::scope::Resolved {
+            bank: bank.clone(),
+            derived: job.derived,
+        }),
         (None, false) => crate::scope::resolve(deps, session_id, None).await?,
     };
+    // Only the user's own sessions are extracted: checked here, where every
+    // path (queued, inline, redelivered, re-resolved) passes.
+    let resolved = match resolved {
+        Some(resolved) => {
+            let meta = crate::scope::session_meta(&deps.iii, session_id.to_string()).await?;
+            let kind = meta.as_ref().and_then(|m| m.get("kind"));
+            extracts(kind.and_then(Value::as_str)).then_some(resolved)
+        }
+        None => None,
+    };
     // Deleted after the turn ran: the pass must not bring it back.
-    let bank_name = match bank_name {
-        Some(b) if b != cfg.default_bank && deps.store().await.is_deleted(&b) => None,
+    let resolved = match resolved {
+        Some(r) if r.bank != cfg.default_bank && deps.store().await.is_deleted(&r.bank) => None,
         other => other,
     };
 
@@ -312,16 +353,19 @@ pub async fn try_run(deps: &Deps, job: &ExtractJobInput) -> Result<(), String> {
         cfg.extraction_window,
     )
     .await?;
-    let Some(bank_name) = bank_name else {
-        // The turn ran without memory (an invalid or deleted bank):
-        // step past it, so a later turn's pass never sweeps it into that
-        // turn's bank — but never past a turn end it could not find.
+    let Some(resolved) = resolved else {
+        // The turn ran without memory (an invalid or deleted bank), or not
+        // with the user (an automation session): step past it, so a later
+        // turn's pass never sweeps it into that turn's bank — but never
+        // past a turn end it could not find.
         let newest = entries.last().map(|(id, ..)| id.as_str());
         if let Some(id) = newest.filter(|_| until_seen || job.until.is_none()) {
             cursor_set(&deps.iii, session_id, id).await;
         }
         return Ok(());
     };
+    let bank_name = resolved.bank.as_str();
+    let layer_name = resolved.layer(&cfg.default_bank);
     let query = entries
         .iter()
         .map(|(_, _, text, _)| text.as_str())
@@ -339,7 +383,14 @@ pub async fn try_run(deps: &Deps, job: &ExtractJobInput) -> Result<(), String> {
         }
         return Ok(());
     }
-    let known = known_memories(deps, &bank_name, &query, cfg.decay_half_life_days).await;
+    let (known, layered) = known_memories(
+        &*deps.store().await,
+        bank_name,
+        layer_name,
+        &query,
+        cfg.decay_half_life_days,
+    )
+    .await;
 
     let model = resolve_model(&deps.iii, &cfg.extraction_model).await?;
     let reply = deps
@@ -377,12 +428,22 @@ pub async fn try_run(deps: &Deps, job: &ExtractJobInput) -> Result<(), String> {
 
     let store = deps.store().await;
     let (bank, created) = store
-        .ensure_bank(&bank_name, None)
+        .ensure_bank(bank_name, None)
         .await
         .map_err(|e| e.to_string())?;
     if created {
-        deps.emitter.bank("created", &bank_name).await;
+        deps.emitter.bank("created", bank_name).await;
     }
+    // The bank a known memory lives in: the layer's, or this one.
+    let layer = match layer_name.filter(|_| !layered.is_empty()) {
+        Some(name) => store.bank(name).await.ok().map(|b| (name, b)),
+        None => None,
+    };
+    let home = |id: &str| match &layer {
+        Some((name, b)) if layered.contains(id) => (*name, b),
+        _ => (bank_name, &bank),
+    };
+    let mut touched = BTreeSet::new();
 
     // Standing instructions graduate straight into the always-injected
     // `learned` rule (visible + editable in the rules tab) instead of the
@@ -415,7 +476,7 @@ pub async fn try_run(deps: &Deps, job: &ExtractJobInput) -> Result<(), String> {
         if added > 0 {
             match bank.set_rule(LEARNED_RULE, &merged) {
                 Ok(()) => {
-                    deps.emitter.bank("rules-changed", &bank_name).await;
+                    deps.emitter.bank("rules-changed", bank_name).await;
                     tracing::info!(session_id, bank = %bank_name, added, "extraction pass learned rules");
                 }
                 Err(e) => tracing::warn!(error = %e, "learned rule write failed"),
@@ -437,7 +498,13 @@ pub async fn try_run(deps: &Deps, job: &ExtractJobInput) -> Result<(), String> {
         let id = fingerprint(text);
         let now = now_ms();
         let target = correction_target(&known, item.replaces).cloned();
-        let existing = match bank.get(&id).await {
+        // A correction lands in the bank of what it corrects, and
+        // supersedes it there; a rewording, where its twin lives.
+        let (mut at_name, mut at) = match &target {
+            Some(old) => home(&old.id),
+            None => (bank_name, &bank),
+        };
+        let existing = match at.get(&id).await {
             Some(m) => Some(m),
             // A rewording of a fact the bank holds is that fact observed
             // again. Not for a correction: it differs from its target on
@@ -446,13 +513,16 @@ pub async fn try_run(deps: &Deps, job: &ExtractJobInput) -> Result<(), String> {
                 let nearby = bank.lexical(text, 5, false).await;
                 let candidates = known.iter().chain(nearby.iter().map(|(m, _)| m));
                 match near_twin(text, candidates).map(|m| m.id.clone()) {
-                    Some(twin) => bank.get(&twin).await,
+                    Some(twin) => {
+                        (at_name, at) = home(&twin);
+                        at.get(&twin).await
+                    }
                     None => None,
                 }
             }
             None => None,
         };
-        let (memory, event) = match existing {
+        let (mut memory, event) = match existing {
             // Known memory re-observed: reinforce, never duplicate. A pinned
             // or tombstoned record is left exactly as it is.
             Some(existing) if existing.is_live() && !existing.pinned => {
@@ -469,9 +539,18 @@ pub async fn try_run(deps: &Deps, job: &ExtractJobInput) -> Result<(), String> {
                 ItemEvent::Created,
             ),
         };
-        match bank.commit(memory.clone()).await {
+        // Written into the layer, it must stay read where the fact it
+        // corrects was, whatever entities the model returned.
+        // ponytail: a repository-scoped override of a fact about the user
+        // ("here we use pnpm") still lands in the layer and reads in every
+        // repository; route it here once memories carry a scope.
+        if at_name != bank_name {
+            crate::scope::into_layer(&mut memory.entities);
+        }
+        match at.commit(memory.clone()).await {
             Ok(CommitKind::Created | CommitKind::Updated) => {
-                deps.emitter.item(event, &bank_name, &memory).await;
+                deps.emitter.item(event, at_name, &memory).await;
+                touched.insert(at_name);
                 saved += 1;
             }
             // Propagate: the cursor must not advance past a span whose
@@ -482,19 +561,19 @@ pub async fn try_run(deps: &Deps, job: &ExtractJobInput) -> Result<(), String> {
         // A correction retires what it corrects: a tombstone pointing at
         // the corrected memory, recoverable like any supersede.
         let old = match target {
-            Some(old) => bank.get(&old.id).await,
+            Some(old) => at.get(&old.id).await,
             None => None,
         };
         if let Some(old) = old.filter(|m| m.is_live() && !m.pinned && m.id != memory.id) {
             let (retired, _) =
                 crate::functions::items::supersede_transition(old, memory.clone(), false, now);
-            bank.commit(retired.clone())
+            at.commit(retired.clone())
                 .await
                 .map_err(|e| format!("memory commit failed: {e}"))?;
             deps.emitter
                 .item_with(
                     ItemEvent::Superseded,
-                    &bank_name,
+                    at_name,
                     &retired,
                     Some("corrected in a later conversation"),
                 )
@@ -509,9 +588,19 @@ pub async fn try_run(deps: &Deps, job: &ExtractJobInput) -> Result<(), String> {
         tracing::info!(session_id, bank = %bank_name, saved, "extraction pass saved memories");
         // Embed the new memories off this path; recall degrades gracefully
         // until the vectors land.
-        crate::embed_client::spawn_backfill(deps, &bank_name);
+        for name in touched {
+            crate::embed_client::spawn_backfill(deps, name);
+        }
     }
     Ok(())
+}
+
+/// Whether a session of `kind` is extracted: the user's own (`user`, or no
+/// kind — sessions from before the field). An automation session (a
+/// sentinel investigation) carries captured failure text and workflow
+/// instructions, never the user's memories or standing instructions.
+fn extracts(kind: Option<&str>) -> bool {
+    matches!(kind, None | Some("user"))
 }
 
 /// A fresh record for one extracted item. `entry_id` is the newest
@@ -826,25 +915,40 @@ fn newest_turn_entry(reply: &Value, turn_id: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-/// Where `turn_id` ended, read when it completes; `None` when
-/// session-manager cannot say or the turn wrote nothing in view (the job
-/// then reads to the newest entry, as before turn ends were tracked).
-pub async fn turn_end(iii: &IIIClient, session_id: &str, turn_id: &str) -> Option<String> {
-    let reply = iii
-        .trigger(TriggerRequest {
-            function_id: "session::messages-tail".into(),
-            payload: json!({
-                "session_id": session_id,
-                "limit": 10,
-                "include_custom": false,
-                "include_image_data": false,
-            }),
-            action: None,
-            timeout_ms: Some(5_000),
-        })
-        .await
-        .ok()?;
-    newest_turn_entry(&reply, turn_id)
+/// Where `turn_id` ended, read when it completes, and the bank the hook
+/// stamped on it (`scope::stamped_bank`); `None` when session-manager
+/// cannot say or the turn wrote nothing in view (the job then reads to the
+/// newest entry, as before turn ends were tracked).
+pub(crate) async fn turn_end(
+    iii: &IIIClient,
+    session_id: &str,
+    turn_id: &str,
+) -> (Option<String>, Option<crate::scope::Resolved>) {
+    let Some(reply) = messages_tail(iii, session_id).await else {
+        return (None, None);
+    };
+    (
+        newest_turn_entry(&reply, turn_id),
+        crate::scope::stamped_bank(&reply, turn_id),
+    )
+}
+
+/// A session's newest `session::messages-tail` page; `None` when
+/// session-manager cannot say.
+pub(crate) async fn messages_tail(iii: &IIIClient, session_id: &str) -> Option<Value> {
+    iii.trigger(TriggerRequest {
+        function_id: "session::messages-tail".into(),
+        payload: json!({
+            "session_id": session_id,
+            "limit": 10,
+            "include_custom": false,
+            "include_image_data": false,
+        }),
+        action: None,
+        timeout_ms: Some(5_000),
+    })
+    .await
+    .ok()
 }
 
 /// One `session::messages` item as `(entry_id, role, text, timestamp_ms)`;
@@ -1413,6 +1517,112 @@ mod tests {
         assert_eq!(items[0].replaces, Some(2));
         let items = parse_items(r#"[{"text":"The user lives in Porto."}]"#).unwrap();
         assert_eq!(items[0].replaces, None);
+    }
+
+    #[test]
+    fn only_the_users_own_sessions_are_extracted() {
+        assert!(extracts(Some("user")));
+        assert!(extracts(None), "a session from before the field");
+        assert!(!extracts(Some("automation")), "a sentinel investigation");
+        assert!(!extracts(Some("e2e")));
+    }
+
+    #[tokio::test]
+    async fn a_directory_bank_knows_the_users_memories_its_layer_holds() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().to_path_buf()).unwrap();
+        let about = |text: &str, entities: &[&str]| Memory {
+            entities: entities.iter().map(|e| e.to_string()).collect(),
+            ..known(text)
+        };
+        let (main, _) = store.ensure_bank("main", None).await.unwrap();
+        let lives = about("The user lives in Lisbon near the river.", &["user"]);
+        let legacy = about(
+            "ledger-sync deploys from Lisbon on Fridays.",
+            &["ledger-sync"],
+        );
+        let both = about("The user likes Lisbon coffee in the morning.", &["user"]);
+        for m in [&lives, &legacy, &both] {
+            main.commit(m.clone()).await.unwrap();
+        }
+        let (repo, _) = store.ensure_bank("w-abc123", None).await.unwrap();
+        repo.commit(both.clone()).await.unwrap();
+
+        let (ms, layered) = known_memories(&store, "w-abc123", Some("main"), "Lisbon", 60).await;
+        let mut ids: Vec<&str> = ms.iter().map(|m| m.id.as_str()).collect();
+        ids.sort();
+        let mut want = vec![lives.id.as_str(), both.id.as_str()];
+        want.sort();
+        assert_eq!(ids, want, "another repository's fact stays out");
+        assert_eq!(
+            layered,
+            HashSet::from([lives.id.clone()]),
+            "a memory both hold is this bank's own"
+        );
+
+        let (ms, layered) = known_memories(&store, "w-abc123", None, "Lisbon", 60).await;
+        assert_eq!(ms.len(), 1, "no layer: this bank alone");
+        assert!(layered.is_empty());
+        let (ms, layered) = known_memories(&store, "new-000000", Some("main"), "Lisbon", 60).await;
+        assert_eq!(
+            ms.len(),
+            2,
+            "a bank not created yet still knows its layer's"
+        );
+        assert_eq!(layered.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn the_layer_never_pushes_a_banks_own_memories_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().to_path_buf()).unwrap();
+        let (repo, _) = store.ensure_bank("w-abc123", None).await.unwrap();
+        let mut own = HashSet::new();
+        for n in 1..=MAX_KNOWN {
+            let m = known(&format!(
+                "Deploy step {n} of the release runs from the ops folder."
+            ));
+            own.insert(m.id.clone());
+            repo.commit(m).await.unwrap();
+        }
+        // A small bank: its idf, so its scores, beat the bigger bank's.
+        let (main, _) = store.ensure_bank("main", None).await.unwrap();
+        for n in 1..=MAX_KNOWN {
+            let m = Memory {
+                entities: vec!["user".into()],
+                ..known(&format!("The user deploy habit {n}."))
+            };
+            main.commit(m).await.unwrap();
+        }
+
+        let (ms, layered) = known_memories(&store, "w-abc123", Some("main"), "deploy", 60).await;
+        let first: HashSet<String> = ms[..MAX_KNOWN].iter().map(|m| m.id.clone()).collect();
+        assert_eq!(first, own, "every own memory stays listed, first");
+        assert_eq!(
+            layered.len(),
+            MAX_KNOWN / 2,
+            "the layer adds at most half as many"
+        );
+        assert_eq!(ms.len(), MAX_KNOWN + MAX_KNOWN / 2);
+    }
+
+    #[tokio::test]
+    async fn a_correction_written_into_the_layer_stays_read_under_a_directory_bank() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().to_path_buf()).unwrap();
+        let (main, _) = store.ensure_bank("main", None).await.unwrap();
+        let mut porto = Memory {
+            entities: vec!["porto".into()],
+            ..known("The user lives in Porto.")
+        };
+        crate::scope::into_layer(&mut porto.entities);
+        crate::scope::into_layer(&mut porto.entities);
+        assert_eq!(porto.entities, ["porto", "user"], "tagged once");
+        main.commit(porto.clone()).await.unwrap();
+
+        let (ms, layered) = known_memories(&store, "w-abc123", Some("main"), "Porto", 60).await;
+        assert_eq!(ms.iter().map(|m| &m.id).collect::<Vec<_>>(), [&porto.id]);
+        assert!(layered.contains(&porto.id));
     }
 
     #[test]
