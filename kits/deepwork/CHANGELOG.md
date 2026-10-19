@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.4.3
+
+- With `isolation=ticket`, the full test suite runs once on the run branch after each wave that landed a ticket, as a background job, before the next wave. Each ticket was verified alone in its own worktree, so two tickets that pass apart and fail together were caught only by the branch review at the end. The result is a `r<N> w<W> landed: green|red|not run` comment on the run ticket. A failure the baseline did not have becomes one `Fix: <tests> after landing <keys>` ticket, retried like any To do ticket. It gets one landing round past `max_rounds` (only those tickets, no critic), so a run that catches a red branch in its last round still fixes it. The suite is skipped, as green, when the wave landed one ticket whose Verify lines ran the same test command on the very tree the run branch now has (`git rev-parse HEAD^{tree}` equals the ticket branch's).
+- Dev cards can be test corrections. A test that pins behaviour the goal or another ticket changes on purpose (one ticket pins `€10.00` while another moves the sign to `10.00 €`) is fixed in the test, not the code: `Test first: correct <test> to expect <behaviour> → passes already (test correction)`. The tests phase changes the test and shows it passes, the code phase commits the test files alone, and review does not count the moved expectation as a weakened test. Before, such a fix ended `blocked`: the tests phase refused a test that already passes and the code phase may not edit tests.
+
 ## 0.4.2
 
 - A lead no longer copies its ticket's result into the document it writes for the orchestrator. Copies of large results came back `null` or cut down to a pointer, so the synthesis and the final report lost them. The lead's document carries `result_from` (the scope and key of the phase document with status `done`), and the orchestrator, the synthesis card's Inputs and the report read the result there with `state::get`, which the orchestrator now preloads. The synthesis runs when at least two done tickets have a `result_from`.
