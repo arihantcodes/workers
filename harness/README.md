@@ -219,25 +219,64 @@ retries) and their defaults live in [`src/config.rs`](src/config.rs).
 
 The harness announces its own usage on the durable `harness:usage` topic. The
 engine subscribes to that topic and sends one anonymous product event for each
-message. Two moments report:
+message. Three moments report:
 
-- `harness_session_progress`, at root turn 1, 2, 5, 10, 25 and 50. Each report
-  carries the cumulative totals that `harness::metrics` aggregates over the
-  session tree: turns, function calls, tokens and cost. A later report
-  supersedes the one before it.
+- `harness_user_turns`, when the user turns (root turns: one user message
+  through its final reply) counted across every session in the state store
+  reach 1, 2, 5, 10, 25 and 50, then every 50 after that (100, 150, ...). It
+  carries `user_turns_total`, `sessions_total`, and `by_model`: user turns per
+  provider and model of the root turn, and sessions per provider and model of
+  the session's first root turn.
+- `harness_model_calls`, on the same milestones of the model calls (assistant
+  messages, sub-agents included) counted across every session in the state
+  store. Model calls move several at a time, so a report goes out at the
+  highest milestone passed. It carries `model_calls_total`, tool call and tool
+  call error totals, token totals, `cost_usd`, `user_turns_total` and
+  `sessions_total`, all across the state store, and `by_model`: model calls,
+  tool calls, tokens and cost per provider and model that generated them.
+
+Every counter on both events, in total and in each `by_model` entry, has a
+matching `*_delta` (for example `tool_calls_delta`, `cost_usd_delta`): the
+count since the previous report of the same event. The deltas of one state
+store sum to its totals, so they can be added up across stores and time
+windows.
+
 - `harness_turn_failed`, once per session for each of the `failed`, `cancelled`
-  and `max_turns` outcomes. This keeps the reason a run stopped exact when it
-  stopped between two milestones.
+  and `max_turns` outcomes. This keeps the reason a run stopped exact.
 
-One session reports at most 9 messages, however many turns it runs, and
-sub-agent turns report nothing of their own. A message carries the model name,
-the provider name, the counters above and a fixed failure class. It carries no
-message text, no prompt, no file path and no function id.
+`harness_turn_failed` carries the failed turn's model and provider; the two
+counting events carry them only inside `by_model`, because their totals span
+every model. Beyond those and the counters above, a message carries only a
+fixed failure class: no message text, no prompt, no file path and no function
+id. Sub-agent turns report nothing of their own; their model calls are
+counted through their root session when its turn ends.
 
-The `harness_usage/<session_id>` state row records the milestones and outcomes
-a session announced, so a restart does not announce one again. Each step is best
-effort: a failed read or publish is logged at debug level and the turn
-continues.
+- A spawn with only a display parent (`parent_session_id`) is not a root turn.
+  Its model calls are counted at the display parent's next root turn. If the
+  parent has no further turn, they are not counted.
+- A spawn with no parent is a root session, so its turn counts as a user turn.
+- A failed turn counts as a user turn. Its `harness_turn_failed` event carries
+  `error_kind`; `llm.unknown_model` means the model is not in the router
+  catalog, and `llm.unknown` means the failure has no classification.
+- A session that an earlier harness release ran takes its usage so far as a
+  baseline on its first turn after the upgrade. That usage is not counted again.
+- A fork (`session::fork`) takes the history it copied as its baseline, so
+  only the model calls the fork makes are counted.
+- The usage already counted is kept per session of the tree. When a session is
+  deleted from the tree, the model calls of the other sessions are still
+  counted.
+
+The reporting keeps its own bookkeeping and only reads the harness's
+accounting (`harness::metrics`). The counters live in the `state` worker's
+store, so each project counts on its own with the default file-backed `state`
+(and an `in_memory` store starts again from zero). The `harness_usage/_machine`
+row holds the store-wide counters, updated by compare-and-set. Each
+`harness_usage/<session_id>` row records the outcomes a session announced and
+the model usage already folded in, per session of its tree, so a turn after a
+restart does not count that usage again. A crash after the `_machine` update
+and before the session row is saved folds that turn's model usage twice. Each
+step is best effort: a failed read or publish is logged at debug level and the
+turn continues.
 
 To stop the reports, set `III_TELEMETRY_ENABLED=false` on the engine. The engine
 then takes the messages from the topic and discards them, so an opted-out
