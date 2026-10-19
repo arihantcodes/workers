@@ -124,26 +124,35 @@ impl ExtractedItem {
 /// paraphrased duplicate) and may correct one by its number.
 const MAX_KNOWN: usize = 12;
 
-/// What the bank already holds about an excerpt: lexical recall over its
-/// message text, then up to half as many of the memories about the user of
-/// the `layer` read under it, so a restated one is reinforced where it lives
-/// instead of copied into this bank, and a corrected one superseded there
-/// unless the correction holds only here ([`placement`]). A bank that does
-/// not exist yet holds nothing. Returns the ids the layer holds too.
+/// Lines past the lexical cap that only meaning finds (a paraphrase, a
+/// correction sharing no words with the excerpt). Their own quota: lexical
+/// recall fills its whole cap on most real excerpts ("I" alone matches every
+/// memory about the user).
+const KNOWN_BY_MEANING: usize = 3;
+
+/// What the bank already holds about an excerpt: its lexical recall over
+/// the message text, then (when `query_vec` is given) what only the vector
+/// finds in the slots left, so a paraphrase or a correction sharing no words
+/// still finds its target without displacing a lexical hit; then, the same
+/// way, up to half as many of the memories about the user of the `layer`
+/// read under it, so a restated one is reinforced where it lives instead of
+/// copied into this bank, and a corrected one superseded there unless the
+/// correction holds only here ([`placement`]). A bank that does not exist
+/// yet holds nothing. Returns the ids the layer holds too.
 async fn known_memories(
     store: &Store,
     bank_name: &str,
     layer: Option<&str>,
     query: &str,
+    query_vec: Option<&crate::embed_client::QueryVector>,
     half_life_days: u64,
 ) -> (Vec<Memory>, HashSet<String>) {
+    let (qv, model) = crate::embed_client::QueryVector::split(query_vec);
     let mut known: Vec<Memory> = match store.bank(bank_name).await {
-        Ok(bank) => bank
-            .recall(query, None, "", MAX_KNOWN, half_life_days, false)
-            .await
-            .into_iter()
-            .map(|(m, _)| m)
-            .collect(),
+        Ok(bank) => {
+            let caps = (MAX_KNOWN, KNOWN_BY_MEANING);
+            listed(&bank, query, qv, model, half_life_days, caps, |_| true).await
+        }
         Err(_) => Vec::new(),
     };
     let layer = match layer {
@@ -157,17 +166,55 @@ async fn known_memories(
     // so a small layer's scores would push out a fact this bank must be
     // able to correct.
     let own: HashSet<String> = known.iter().map(|m| m.id.clone()).collect();
-    let extra: Vec<Memory> = layer
+    let keep = |m: &Memory| crate::scope::in_layer(m) && !own.contains(&m.id);
+    let extra = listed(
+        &layer,
+        query,
+        qv,
+        model,
+        half_life_days,
+        (MAX_KNOWN / 2, KNOWN_BY_MEANING - 1),
+        keep,
+    )
+    .await;
+    let layered = extra.iter().map(|m| m.id.clone()).collect();
+    known.extend(extra);
+    (known, layered)
+}
+
+/// `bank`'s live memories that `keep` accepts: up to `lexical` of lexical
+/// recall for `query`, then up to `by_meaning` semantic hits for `qv` not
+/// listed yet, so a vector never displaces a lexical line nor waits for one
+/// to leave room.
+async fn listed(
+    bank: &Bank,
+    query: &str,
+    qv: Option<&[f32]>,
+    model: &str,
+    half_life_days: u64,
+    (lexical, by_meaning): (usize, usize),
+    keep: impl Fn(&Memory) -> bool,
+) -> Vec<Memory> {
+    let mut seen = HashSet::new();
+    let mut out: Vec<Memory> = bank
         .recall(query, None, "", usize::MAX, half_life_days, false)
         .await
         .into_iter()
         .map(|(m, _)| m)
-        .filter(|m| crate::scope::in_layer(m) && !own.contains(&m.id))
-        .take(MAX_KNOWN / 2)
+        .filter(|m| keep(m) && seen.insert(m.id.clone()))
+        .take(lexical)
         .collect();
-    let layered = extra.iter().map(|m| m.id.clone()).collect();
-    known.extend(extra);
-    (known, layered)
+    if let Some(qv) = qv {
+        let semantic = bank.semantic(qv, model, usize::MAX, false).await;
+        out.extend(
+            semantic
+                .into_iter()
+                .map(|(m, _)| m)
+                .filter(|m| keep(m) && seen.insert(m.id.clone()))
+                .take(by_meaning),
+        );
+    }
+    out
 }
 
 /// The extraction model's input: the numbered known memories, then the
@@ -469,11 +516,14 @@ pub async fn try_run(deps: &Deps, job: &ExtractJobInput) -> Result<(), String> {
         }
         return Ok(());
     }
+    // Fail-soft semantic signal; lexical-only when it misses.
+    let query_vec = crate::embed_client::query_vector(deps, &crate::store::cap_query(&query)).await;
     let (known, layered) = known_memories(
         &*deps.store().await,
         bank_name,
         layer_name,
         &query,
+        query_vec.as_ref(),
         cfg.decay_half_life_days,
     )
     .await;
@@ -1745,7 +1795,8 @@ mod tests {
         let (repo, _) = store.ensure_bank("w-abc123", None).await.unwrap();
         repo.commit(both.clone()).await.unwrap();
 
-        let (ms, layered) = known_memories(&store, "w-abc123", Some("main"), "Lisbon", 60).await;
+        let (ms, layered) =
+            known_memories(&store, "w-abc123", Some("main"), "Lisbon", None, 60).await;
         let mut ids: Vec<&str> = ms.iter().map(|m| m.id.as_str()).collect();
         ids.sort();
         let mut want = vec![lives.id.as_str(), both.id.as_str()];
@@ -1757,16 +1808,101 @@ mod tests {
             "a memory both hold is this bank's own"
         );
 
-        let (ms, layered) = known_memories(&store, "w-abc123", None, "Lisbon", 60).await;
+        let (ms, layered) = known_memories(&store, "w-abc123", None, "Lisbon", None, 60).await;
         assert_eq!(ms.len(), 1, "no layer: this bank alone");
         assert!(layered.is_empty());
-        let (ms, layered) = known_memories(&store, "new-000000", Some("main"), "Lisbon", 60).await;
+        let (ms, layered) =
+            known_memories(&store, "new-000000", Some("main"), "Lisbon", None, 60).await;
         assert_eq!(
             ms.len(),
             2,
             "a bank not created yet still knows its layer's"
         );
         assert_eq!(layered.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn the_known_list_finds_a_paraphrase_by_its_vector() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().to_path_buf()).unwrap();
+        let (main, _) = store.ensure_bank("main", None).await.unwrap();
+        let (repo, _) = store.ensure_bank("w-abc123", None).await.unwrap();
+        let build = known("The project builds with Bazel.");
+        let city = Memory {
+            entities: vec!["user".into()],
+            ..known("The user lives in Porto.")
+        };
+        for (bank, m) in [(&repo, &build), (&main, &city)] {
+            bank.commit(m.clone()).await.unwrap();
+            bank.set_vector(&m.id, "m", &m.text, vec![1.0, 0.0])
+                .await
+                .unwrap();
+        }
+        // No word in common with either memory.
+        let excerpt = "relocation northward happened; compilation tooling switched";
+        let (ms, _) = known_memories(&store, "w-abc123", Some("main"), excerpt, None, 60).await;
+        assert!(ms.is_empty(), "lexical-only finds nothing");
+        let qv = crate::embed_client::QueryVector {
+            model: "m".into(),
+            v: vec![1.0, 0.0],
+        };
+        let (ms, layered) =
+            known_memories(&store, "w-abc123", Some("main"), excerpt, Some(&qv), 60).await;
+        assert_eq!(
+            ms.iter().map(|m| &m.id).collect::<Vec<_>>(),
+            [&build.id, &city.id]
+        );
+        assert_eq!(layered, HashSet::from([city.id.clone()]));
+    }
+
+    #[tokio::test]
+    async fn the_vector_finds_past_a_full_lexical_list_never_in_place_of_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().to_path_buf()).unwrap();
+        let (repo, _) = store.ensure_bank("w-abc123", None).await.unwrap();
+        let (main, _) = store.ensure_bank("main", None).await.unwrap();
+        let about = |text: &str| Memory {
+            entities: vec!["user".into()],
+            ..known(text)
+        };
+        // One lexical hit more than the bank lists.
+        let mut lexical = HashSet::new();
+        for n in 0..=MAX_KNOWN {
+            let m = known(&format!(
+                "Deploy step {n} of the release runs from the ops folder."
+            ));
+            lexical.insert(m.id.clone());
+            repo.commit(m).await.unwrap();
+        }
+        // Paraphrases only the vector finds.
+        let shipping = known("Shipping goes out through the pipeline.");
+        let ships = about("The user never ships after lunch.");
+        for (bank, m) in [(&repo, &shipping), (&main, &ships)] {
+            bank.commit(m.clone()).await.unwrap();
+            bank.set_vector(&m.id, "m", &m.text, vec![1.0, 0.0])
+                .await
+                .unwrap();
+        }
+        let habit = about("The user likes to deploy on Fridays.");
+        main.commit(habit.clone()).await.unwrap();
+
+        let qv = crate::embed_client::QueryVector {
+            model: "m".into(),
+            v: vec![1.0, 0.0],
+        };
+        let (ms, layered) =
+            known_memories(&store, "w-abc123", Some("main"), "deploy", Some(&qv), 60).await;
+        assert!(
+            ms[..MAX_KNOWN].iter().all(|m| lexical.contains(&m.id)),
+            "a full list keeps its lexical hits"
+        );
+        assert_eq!(
+            ms[MAX_KNOWN..].iter().map(|m| &m.id).collect::<Vec<_>>(),
+            [&shipping.id, &habit.id, &ships.id],
+            "past the full lexical list, the vector's find; then the layer's \
+             lexical hit and its vector's find"
+        );
+        assert_eq!(layered, HashSet::from([habit.id.clone(), ships.id.clone()]));
     }
 
     #[tokio::test]
@@ -1851,7 +1987,8 @@ mod tests {
             main.commit(m).await.unwrap();
         }
 
-        let (ms, layered) = known_memories(&store, "w-abc123", Some("main"), "deploy", 60).await;
+        let (ms, layered) =
+            known_memories(&store, "w-abc123", Some("main"), "deploy", None, 60).await;
         let first: HashSet<String> = ms[..MAX_KNOWN].iter().map(|m| m.id.clone()).collect();
         assert_eq!(first, own, "every own memory stays listed, first");
         assert_eq!(
@@ -1876,7 +2013,8 @@ mod tests {
         assert_eq!(porto.entities, ["porto", "user"], "tagged once");
         main.commit(porto.clone()).await.unwrap();
 
-        let (ms, layered) = known_memories(&store, "w-abc123", Some("main"), "Porto", 60).await;
+        let (ms, layered) =
+            known_memories(&store, "w-abc123", Some("main"), "Porto", None, 60).await;
         assert_eq!(ms.iter().map(|m| &m.id).collect::<Vec<_>>(), [&porto.id]);
         assert!(layered.contains(&porto.id));
     }

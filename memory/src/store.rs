@@ -33,11 +33,17 @@ const VECTORS_FILE: &str = "vectors.jsonl";
 const RULES_DIR: &str = "rules";
 const BANK_META: &str = "bank.yaml";
 const TRASH_DIR: &str = ".trash";
-/// Weight of the cosine similarity in the fused recall score, sized so a
-/// strong semantic match competes with a solid BM25 hit.
-const SEMANTIC_WEIGHT: f32 = 2.2;
+/// Weight of the semantic arm (cosine on an absolute scale from
+/// `SEMANTIC_ANCHOR`, never divided by the pool's best) against the
+/// max-normalized BM25 in the fused recall score.
+const SEMANTIC_WEIGHT: f32 = 16.0;
 /// Semantic candidates below this cosine are noise, not recall.
 const SEMANTIC_FLOOR: f32 = 0.25;
+/// Cosine the semantic arm counts from. Just below the floor on purpose:
+/// at the floor itself the small cosine gap between a stale fact and its
+/// update becomes a ratio past what the recency multiplier corrects (recall
+/// eval: 3-4 traps at every weight from 2 to 24, against 2).
+const SEMANTIC_ANCHOR: f32 = 0.2;
 
 pub struct Store {
     root: PathBuf,
@@ -719,6 +725,53 @@ impl Bank {
         half_life_days: u64,
         include_superseded: bool,
     ) -> Vec<(Memory, f32)> {
+        self.recall_scaled(
+            query,
+            query_vec,
+            embedding_model,
+            limit,
+            half_life_days,
+            include_superseded,
+            0.0,
+        )
+        .await
+    }
+
+    /// The best raw BM25 any live memory `keep` accepts scores for `query`
+    /// (only what the caller can rank sets the scale): what a caller
+    /// merging several banks into one ranking passes to
+    /// [`Bank::recall_scaled`] (the maximum over all of them), so every bank's
+    /// lexical arm divides by the same number.
+    pub async fn bm25_max(&self, query: &str, keep: impl Fn(&Memory) -> bool) -> f32 {
+        let inner = self.inner.read().await;
+        inner
+            .index
+            .score(&query_tokens(query))
+            .into_iter()
+            .filter(|(id, _)| {
+                inner
+                    .memories
+                    .get(id)
+                    .is_some_and(|m| m.is_live() && keep(m))
+            })
+            .map(|(_, s)| s)
+            .fold(0.0, f32::max)
+    }
+
+    /// [`Bank::recall`] with the lexical arm divided by `bm25_max` (or this
+    /// bank's own best, when larger), so hits from banks recalled with the
+    /// same `bm25_max` compare by score.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn recall_scaled(
+        &self,
+        query: &str,
+        query_vec: Option<&[f32]>,
+        embedding_model: &str,
+        limit: usize,
+        half_life_days: u64,
+        include_superseded: bool,
+        bm25_max: f32,
+    ) -> Vec<(Memory, f32)> {
         let query_tokens = query_tokens(query);
         if query_tokens.is_empty() && query_vec.is_none() {
             return Vec::new();
@@ -749,15 +802,28 @@ impl Bank {
                 }
             }
         }
-        let now = now_ms();
-        let mut scored: Vec<(Memory, f32)> = bm25
+        let candidates: Vec<(Memory, f32, f32)> = bm25
             .into_iter()
-            .filter_map(|(id, s)| inner.memories.get(&id).map(|f| (f.clone(), s, id)))
-            .filter(|(f, _, _)| include_superseded || f.is_live())
-            .map(|(f, s, id)| {
+            .filter_map(|(id, s)| {
+                let f = inner.memories.get(&id)?;
+                (include_superseded || f.is_live())
+                    .then(|| (f.clone(), s, sem.get(&id).copied().unwrap_or(0.0)))
+            })
+            .collect();
+        // BM25 over the best candidate (or the caller's shared maximum);
+        // cosine on an absolute scale, so a weak best match stays weak.
+        let max_bm25 = candidates
+            .iter()
+            .map(|c| c.1)
+            .fold(bm25_max.max(f32::EPSILON), f32::max);
+        let now = now_ms();
+        let mut scored: Vec<(Memory, f32)> = candidates
+            .into_iter()
+            .map(|(f, s, c)| {
                 // Semantic joins lexical BEFORE fusion so recency decays
                 // both alike.
-                let relevance = s + sem.get(&id).map_or(0.0, |c| SEMANTIC_WEIGHT * c);
+                let sem = ((c - SEMANTIC_ANCHOR) / (1.0 - SEMANTIC_ANCHOR)).max(0.0);
+                let relevance = s / max_bm25 + SEMANTIC_WEIGHT * sem;
                 let fused =
                     crate::index::fused_score(relevance, &f, &query_tokens, now, half_life_days);
                 (f, fused)
@@ -1480,6 +1546,31 @@ mod tests {
         sorted.sort();
         assert_eq!(ids.len(), 6);
         assert_eq!(ids, sorted, "ties break by id, not HashMap order");
+    }
+
+    #[tokio::test]
+    async fn lexical_only_recall_keeps_bm25_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().to_path_buf()).unwrap();
+        let (bank, _) = store.ensure_bank("main", None).await.unwrap();
+        // Same age, no pins or entities: normalizing the BM25 arm by its
+        // maximum must not reorder anything.
+        for text in [
+            "kiwi mango smoothie recipe",
+            "kiwi mango",
+            "kiwi with a lot of other filler words around it",
+            "mango sorbet",
+        ] {
+            let mut m = memory(text);
+            m.updated_at = 1_000;
+            bank.commit(m).await.unwrap();
+        }
+        let q = "kiwi mango smoothie";
+        let ids =
+            |hits: Vec<(Memory, f32)>| hits.into_iter().map(|(m, _)| m.id).collect::<Vec<_>>();
+        let lexical = ids(bank.lexical(q, 10, false).await);
+        assert_eq!(lexical.len(), 4);
+        assert_eq!(ids(bank.recall(q, None, "", 10, 30, false).await), lexical);
     }
 
     #[tokio::test]
