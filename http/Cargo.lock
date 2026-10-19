@@ -837,7 +837,7 @@ dependencies = [
 
 [[package]]
 name = "iii-http"
-version = "0.22.6"
+version = "0.22.7"
 dependencies = [
  "anyhow",
  "async-trait",
